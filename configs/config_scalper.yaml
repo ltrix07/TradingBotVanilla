@@ -45,25 +45,26 @@ strategy:
 
 risk_management:
   initial_balance_usd: 1000.0
-  position_size_pct: 0.03       # Small bets — 3% per trade
-  max_daily_loss_pct: 0.15      # 15% daily limit (room for many trades)
-  min_time_before_expiry_sec: 90   # Enter earlier — wider opportunity window
+  risk_per_trade_pct: 0.01      # Рискуем строго 1% в сделке
+  max_daily_loss_pct: 0.04      # Дневной лимит 4%
+  min_time_before_expiry_sec: 90
   max_time_before_expiry_sec: 350
 
-  use_sl_tp: true
+  use_sl_tp: true               # Включено для фьючерсов
   use_hard_tp: true
   use_hard_sl: true
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 3.0        # SL beyond market noise
-  atr_tp_multiplier: 4.5        # TP = 1.5x SL distance
+  atr_sl_multiplier: 3.0        
+  atr_tp_multiplier: 4.5        
 
-  sl_confirm_seconds: 10        # Wait 10s to confirm SL breach is real, not a spike
-  cooldown_after_sl_sec: 20     # Quick re-entry after SL
+  sl_confirm_seconds: 10        # Быстрый выход для скальпера
+  cooldown_after_sl_sec: 20     # Быстрый перезаход для скальпера
 
   trailing_stop_enabled: true
   trailing_stop_atr_multiplier: 1.5
+  breakeven_atr_multiplier: 1.0 # Перевод в безубыток
 
 trading:
   use_ws: true

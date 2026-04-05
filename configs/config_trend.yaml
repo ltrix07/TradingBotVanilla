@@ -48,11 +48,10 @@ strategy:
 
 risk_management:
   initial_balance_usd: 1000.0
-  # [REMOVED] position_size_pct — replaced by risk-based sizing below
-  risk_per_trade_pct: 0.01      # Risk 1% of balance per trade (prop firm standard)
-  max_daily_loss_pct: 0.04      # [CHANGED] 4% daily drawdown limit (prop firm rule)
-  min_time_before_expiry_sec: 90
-  max_time_before_expiry_sec: 350
+  risk_per_trade_pct: 0.01      # Рискуем строго 1% в сделке
+  max_daily_loss_pct: 0.04      # Дневной лимит 4%
+  min_time_before_expiry_sec: 120
+  max_time_before_expiry_sec: 400
 
   use_sl_tp: true
   use_hard_tp: true
@@ -60,15 +59,15 @@ risk_management:
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 3.0        # SL = 3x ATR beyond entry (market noise filter)
-  atr_tp_multiplier: 4.5        # TP = 4.5x ATR (R:R ≈ 1.5)
+  atr_sl_multiplier: 3.0        
+  atr_tp_multiplier: 4.5        
 
-  sl_confirm_seconds: 12        # Wait 12s to confirm SL breach is real, not a spike
-  cooldown_after_sl_sec: 45
+  sl_confirm_seconds: 15        
+  cooldown_after_sl_sec: 60     
 
   trailing_stop_enabled: true
   trailing_stop_atr_multiplier: 1.5
-  breakeven_atr_multiplier: 1.0 # [NEW] Move stop to entry_price after 1x ATR profit
+  breakeven_atr_multiplier: 1.0 # Перевод в безубыток
 
 trading:
   use_ws: true

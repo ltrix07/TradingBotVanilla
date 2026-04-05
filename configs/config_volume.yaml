@@ -49,8 +49,8 @@ strategy:
 
 risk_management:
   initial_balance_usd: 1000.0
-  position_size_pct: 0.06       # 6% — moderate-to-high conviction
-  max_daily_loss_pct: 0.12      # 12% daily limit
+  risk_per_trade_pct: 0.01      
+  max_daily_loss_pct: 0.04      
   min_time_before_expiry_sec: 100
   max_time_before_expiry_sec: 400
 
@@ -60,14 +60,15 @@ risk_management:
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 3.0        # SL beyond market noise
-  atr_tp_multiplier: 4.5        # TP = 1.5x SL distance
+  atr_sl_multiplier: 3.0        
+  atr_tp_multiplier: 4.5        
 
-  sl_confirm_seconds: 12        # Wait 12s to confirm SL breach is real, not a spike
+  sl_confirm_seconds: 12        
   cooldown_after_sl_sec: 40
 
   trailing_stop_enabled: true
   trailing_stop_atr_multiplier: 1.5
+  breakeven_atr_multiplier: 1.0
 
 trading:
   use_ws: true
