@@ -1,0 +1,10 @@
+{
+  "virtual_portfolio": {
+    "balance_usd": 1000.0,
+    "active_position": null,
+    "daily_pnl": 0.0,
+    "last_update": null,
+    "trading_halted_until": null
+  },
+  "trade_history": []
+}

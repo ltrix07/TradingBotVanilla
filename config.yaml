@@ -1,0 +1,99 @@
+# ==========================================
+# POLYMARKET PAPER TRADING BOT CONFIGURATION
+# ==========================================
+
+market:
+  # token_id не используется — бот находит маркет через discovery.
+  token_id: ""
+  polling_interval_seconds: 10
+  network: "polygon-mainnet"
+
+discovery:
+  enabled: true
+  query: "Bitcoin Up or Down"      # Основной поисковый запрос
+  coin_slug_prefix: "btc-"         # Только BTC маркеты; "" = любой тикер
+  limit: 50
+  gamma_api: "https://gamma-api.polymarket.com"
+
+strategy:
+  name: "FastMACD"
+  timeframe: "1s"
+  parameters:
+    fast_ema: 30
+    slow_ema: 120
+    signal_smoothing: 30
+  indicators:
+    - name: "MACD"
+      source: "pandas_ta"
+    - name: "PriceSource"
+      api: "Binance-REST"
+  # RSI confirmation filter: blocks signal when RSI is at extreme
+  rsi:
+    period: 14
+    overbought: 65           # Don't BUY_YES when RSI >= 65 (already stretched)
+    oversold: 35             # Don't BUY_NO  when RSI <= 35 (already stretched)
+  # Order book depth analysis
+  order_book:
+    imbalance_threshold: 0.52  # bid_vol/total_vol > 0.60 = bullish confirmation
+    depth_levels: 5            # How many price levels to sum for volume
+
+risk_management:
+  initial_balance_usd: 1000.0
+  position_size_pct: 0.05
+  stop_loss_pct: 0.07
+  take_profit_pct: 0.10
+  max_daily_loss_pct: 0.10
+  min_time_before_expiry_sec: 120
+  max_time_before_expiry_sec: 400
+  
+  # 1. Главный рубильник: отключаем проверку SL и TP
+  use_sl_tp: true
+
+  # Hard TP/SL: WebSocket-based limit checks between poll cycles (paper trading)
+  use_hard_tp: true
+  use_hard_sl: true
+
+  use_atr_dynamic: true
+  atr_period: 14
+  atr_sl_multiplier: 15.0
+  atr_tp_multiplier: 20.0
+  
+  # Early exit: Time-Stop (close stale positions that go nowhere)
+  use_time_stop: true
+  time_stop_seconds: 120            # Max hold time before force-closing a "dead" position
+  time_stop_max_loss_pct: 0.02      # Only time-stop if unrealised loss ≤ 2% (else wait for SL)
+
+  # Early exit: Reverse-Close (close on opposite MACD signal)
+  use_reverse_close: true
+
+  cooldown_after_sl_sec: 60        # Пауза после Stop Loss перед новым входом
+
+  # 2. Отключаем трейлинг-стоп, чтобы позиция не закрывалась при откатах
+  trailing_stop_enabled: true      
+  trailing_stop_atr_multiplier: 2.0
+
+trading:
+  use_ws: true                      # WebSocket real-time book feed (requires `websockets`)
+  use_binance_ws: true              # Binance aggTrade WS for tick-based candles (default false in old configs)
+  binance_ws_candle_history: 300     # Number of completed candles to keep in memory
+  signal_confirmation_ticks: 2      # Ticks the signal must hold for (double confirmation)
+
+simulation:
+  # execution.py строит полный путь как ../data/<state_file>
+  state_file: "state.json"
+  log_file: "trades.csv"
+  slippage_simulation_pct: 0.001   # Base slippage on entry/exit
+  fee_simulation_pct: 0.000
+  # Realistic market impact: larger orders move price more
+  market_impact_factor: 0.002      # price_impact = factor * (size_usd / liquidity)
+  # Fallback liquidity when order book data is unavailable
+  liquidity_fallback_usd: 1000.0   # Realistic BTC market liquidity ($500-$5000)
+  # Partial fill simulation: not all orders fill 100%
+  partial_fill_min_pct: 0.85       # Fill between 85%-100% of requested size
+
+endpoints:
+  polymarket_clob: "https://clob.polymarket.com"
+  binance_v3: "https://api.binance.com/api/v3"
+  # proxy: "http://skotarenko13802NDV:mrmcIFWs2S@194.35.226.36:50100"   # Раскомментируй для Polymarket (Cloudflare bypass)
+  telegram_bot_token: "8602019058:AAFaJkXq2Uj8OyxC4lJ5dze1gf0fp5KDr6w"   # Вставь токен от @BotFather, например: "7123456789:AAFxxx..."
+  telegram_chat_id: "324521546"     # Твой chat_id (число), например: "123456789"

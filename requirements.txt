@@ -1,0 +1,9 @@
+httpx==0.28.1
+numpy==2.2.6
+pandas==2.3.2
+pandas-ta>=0.3.14b
+PyYAML==6.0.2
+python-dateutil==2.9.0.post0
+pytz==2025.2
+tzdata==2025.2
+websockets>=12.0
