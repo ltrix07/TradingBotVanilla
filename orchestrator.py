@@ -32,14 +32,18 @@ HYBRID_LOG_FILE = os.path.join(LOGS_DIR, "hybrid_bot.log")
 
 active_process = None
 active_log_file = None  # Global handle — closed explicitly on terminate
-current_mode = "pause"  # 'sniper', 'trend', 'pause'
+current_mode = "none"  # до первого orchestrate(); потом 'sniper', 'volume' или 'trend'
 
 def get_time():
     return datetime.now().strftime('%H:%M:%S')
 
 def get_market_data():
-    """Получает данные с Binance и рассчитывает ADX"""
-    url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit=150"
+    """Получает klines с Binance Futures и рассчитывает ADX.
+
+    Используем тот же REST endpoint что и основной бот (/fapi/v1/klines)
+    чтобы режимы ADX считались по тому же рынку где бот торгует.
+    """
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={SYMBOL}&interval={TIMEFRAME}&limit=150"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
@@ -122,21 +126,18 @@ def switch_mode(target_mode):
 
     current_mode = target_mode
 
-    if target_mode == "pause":
-        print(f"[{get_time()}] ⏸ Бот переведен в режим ПАУЗЫ (рынок неопределен).")
-    else:
-        prepare_hybrid_config(target_mode)
-        print(f"[{get_time()}] 🚀 Запускаем логику: {target_mode.upper()} (Стейт: Гибрид)")
-        print(f"[{get_time()}] 📝 Логи сделок пишутся в файл: {HYBRID_LOG_FILE}")
+    prepare_hybrid_config(target_mode)
+    print(f"[{get_time()}] 🚀 Запускаем логику: {target_mode.upper()} (Стейт: Гибрид)")
+    print(f"[{get_time()}] 📝 Логи сделок пишутся в файл: {HYBRID_LOG_FILE}")
 
-        active_log_file = open(HYBRID_LOG_FILE, "a", encoding="utf-8")
-        cmd = [sys.executable, "src/main.py", "--config", HYBRID_CONFIG_FILE]
-        active_process = subprocess.Popen(
-            cmd,
-            stdout=active_log_file,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
+    active_log_file = open(HYBRID_LOG_FILE, "a", encoding="utf-8")
+    cmd = [sys.executable, "src/main.py", "--config", HYBRID_CONFIG_FILE]
+    active_process = subprocess.Popen(
+        cmd,
+        stdout=active_log_file,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
 
 def orchestrate():
     adx = get_market_data()
@@ -145,10 +146,15 @@ def orchestrate():
 
     print(f"\n[{get_time()}] 📊 Текущий ADX: {adx:.2f}")
 
-    if adx < 25:
+    # ADX regime mapping (reviewed vs. Polymarket baseline where PAUSE took 40% of time):
+    #   < 20     — очень слабый тренд / флэт → sniper (редкие высококонвикционные входы)
+    #   20 – 35  — средний рынок → volume (фильтр по всплеску объёма)
+    #   >= 35    — сильный тренд → trend (ride momentum)
+    # PAUSE удалён: volume-режим работает во всей средней зоне ADX.
+    if adx < 20:
         target_mode = "sniper"
-    elif adx <= 40:
-        target_mode = "pause"
+    elif adx < 35:
+        target_mode = "volume"
     else:
         target_mode = "trend"
 

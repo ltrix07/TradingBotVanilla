@@ -125,7 +125,6 @@ def _apply_entry_filters(
     signal: str,
     book_data: dict | None,
     candles: list[dict],
-    market_open_price: float | None = None,
 ) -> bool:
     """Return True if the signal passes all configured entry_filters.
 
@@ -135,45 +134,6 @@ def _apply_entry_filters(
     filters = cfg.get("strategy", {}).get("entry_filters", {})
     if not filters:
         return True
-
-    # ── Price filters (require book_data) ─────────────────────────────────
-    if book_data is not None:
-        # Determine the reference price depending on signal direction
-        if signal == "BUY_YES":
-            ref_price = book_data.get("best_ask")
-        else:
-            ref_price = book_data.get("best_bid")
-
-        if ref_price is not None:
-            uncertainty_band = filters.get("market_uncertainty_band")
-
-            if uncertainty_band is not None:
-                # Symmetric band around 0.5 — has priority over max/min
-                low = 0.5 - float(uncertainty_band)
-                high = 0.5 + float(uncertainty_band)
-                if not (low <= ref_price <= high):
-                    logging.info(
-                        "entry_filter BLOCKED: price %.4f outside uncertainty band [%.2f, %.2f]",
-                        ref_price, low, high,
-                    )
-                    return False
-            else:
-                # Individual max/min price gates
-                max_price = filters.get("max_token_price")
-                if max_price is not None and ref_price > float(max_price):
-                    logging.info(
-                        "entry_filter BLOCKED: price %.4f > max_token_price %.2f",
-                        ref_price, float(max_price),
-                    )
-                    return False
-
-                min_price = filters.get("min_token_price")
-                if min_price is not None and ref_price < float(min_price):
-                    logging.info(
-                        "entry_filter BLOCKED: price %.4f < min_token_price %.2f",
-                        ref_price, float(min_price),
-                    )
-                    return False
 
     # ── Trend direction filter (EMA-based) ─────────────────────────────
     trend_period = filters.get("trend_ema_period")
@@ -197,27 +157,6 @@ def _apply_entry_filters(
                         "(close %.2f > EMA%d %.2f)", current_close, trend_period, ema_now,
                     )
                     return False
-
-    # ── Market open price filter ───────────────────────────────────────
-    # Polymarket 5-min markets resolve: YES wins if BTC at expiry > BTC
-    # at market open, NO wins otherwise.  Only allow signals aligned with
-    # BTC's current position relative to the market open price.
-    if market_open_price is not None and candles:
-        current_btc = float(candles[-1]["close"])
-        if signal == "BUY_YES" and current_btc < market_open_price:
-            logging.info(
-                "entry_filter BLOCKED: BUY_YES but BTC %.2f < market open %.2f "
-                "(NO is currently winning)",
-                current_btc, market_open_price,
-            )
-            return False
-        if signal == "BUY_NO" and current_btc > market_open_price:
-            logging.info(
-                "entry_filter BLOCKED: BUY_NO but BTC %.2f > market open %.2f "
-                "(YES is currently winning)",
-                current_btc, market_open_price,
-            )
-            return False
 
     # ── Volume spike filter (uses Binance candle data) ────────────────────
     require_spike = filters.get("require_volume_spike")
@@ -246,7 +185,6 @@ def generate_signal(
     cfg: dict,
     book_data: dict | None = None,
     is_last_candle_open: bool = False,
-    market_open_price: float | None = None,
 ) -> str | None:
     """Generate a trading signal using MACD + RSI + order book confirmation.
 
@@ -261,10 +199,11 @@ def generate_signal(
     Args:
         candles:              List of OHLCV dicts (Binance 1m candles).
         cfg:                  Bot configuration dict.
-        book_data:            Optional dict from fetch_polymarket_book_async (for depth).
+        book_data:            Optional dict from order-book fetcher (for depth).
         is_last_candle_open:  True when the last candle is still forming (live WS feed).
 
-    Returns 'BUY_YES', 'BUY_NO', or None.
+    Returns 'BUY_YES' (→ LONG), 'BUY_NO' (→ SHORT), or None.
+    The caller (main.py) maps BUY_YES→LONG, BUY_NO→SHORT before calling execution.
     """
     if len(candles) < 20:
         return None
@@ -314,7 +253,7 @@ def generate_signal(
     book_ok = _compute_book_confirmation(book_data, cfg, macd_signal)
 
     # MACD + at least one confirmation (RSI or book imbalance).
-    # Polymarket 5-min books are thin — requiring both kills too many valid signals.
+    # Requiring both kills too many valid signals in thin or one-sided books.
     if book_available:
         if not (rsi_ok or book_ok):
             return None
@@ -323,7 +262,7 @@ def generate_signal(
             return None
 
     # Entry filters — optional last-layer gate
-    if not _apply_entry_filters(cfg, macd_signal, book_data, candles, market_open_price=market_open_price):
+    if not _apply_entry_filters(cfg, macd_signal, book_data, candles):
         return None
 
     return macd_signal

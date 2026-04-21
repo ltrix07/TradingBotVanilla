@@ -54,7 +54,7 @@ def _load_config(config_path: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Reset Polymarket paper trading state file(s).",
+        description="Reset crypto futures paper trading state file(s).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

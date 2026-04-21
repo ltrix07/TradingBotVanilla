@@ -53,15 +53,22 @@ def analyze_data(trades_df, market_df):
     print("="*50)
 
     # 1. Зависимость Win Rate от силы тренда (ADX)
+    # Границы буckets совпадают с orchestrator'ом: <20 sniper, 20–35 volume, ≥35 trend.
     print("\n📈 1. Зависимость Win Rate от силы тренда (ADX):")
-    # Разбиваем ADX на корзины: Флэт (<25), Слабый тренд (25-40), Сильный тренд (>40)
-    merged_df['adx_bucket'] = pd.cut(merged_df['adx_15m'], bins=[0, 25, 40, 100], labels=['Flat (<25)', 'Trend (25-40)', 'Strong (>40)'])
-    
+    merged_df['adx_bucket'] = pd.cut(
+        merged_df['adx_15m'],
+        bins=[0, 20, 35, 100],
+        labels=['Weak (<20)', 'Medium (20-35)', 'Strong (>=35)']
+    )
+
+    # Win rate определяется по знаку PnL, т.к. result={SL,TP,TIME_STOP,MAX_HOLD,REVERSE_CLOSE}
+    # и TIME_STOP/MAX_HOLD/REVERSE_CLOSE могут закрыть сделку как в плюс, так и в минус.
     adx_stats = merged_df.groupby(['config', 'adx_bucket']).apply(
         lambda x: pd.Series({
             'Trades': len(x),
-            'Win Rate %': (x['result'] == 'WIN').mean() * 100 if len(x) > 0 else 0,
-            'Total PnL': x['pnl'].sum()
+            'Win Rate %': (x['pnl'] > 0).mean() * 100 if len(x) > 0 else 0,
+            'Total PnL': x['pnl'].sum(),
+            'Avg PnL':   x['pnl'].mean() if len(x) > 0 else 0,
         })
     ).reset_index()
     print(adx_stats.to_string())
@@ -71,23 +78,20 @@ def analyze_data(trades_df, market_df):
     for config in merged_df['config'].unique():
         config_data = merged_df[merged_df['config'] == config]
         correlation = config_data['pnl'].corr(config_data['atr_15m'])
-        print(f" - {config}: корреляция {correlation:.2f} (Чем ближе к 1, тем лучше бот работает при высокой волатильности)")
+        print(f" - {config}: корреляция {correlation:.2f} "
+              f"(>0 = бот лучше работает при высокой волатильности, <0 наоборот)")
 
-    # 3. Анализ срабатываний Stop Loss / Take Profit
-    print("\n🛑 3. Анализ срабатываний Stop Loss / Take Profit:")
-    sl_hits = merged_df[merged_df['result'] == 'SL']
-    tp_hits = merged_df[merged_df['result'] == 'TP']
-    
-    print(f"Всего закрытий по SL: {len(sl_hits)}")
-    print(f"Всего закрытий по TP: {len(tp_hits)}")
-    
+    # 3. Анализ срабатываний по типам выхода
+    print("\n🛑 3. Анализ типов закрытий:")
     for config in merged_df['config'].unique():
-        bot_sl = sl_hits[sl_hits['config'] == config]
-        bot_tp = tp_hits[tp_hits['config'] == config]
-        
-        sl_saved_estimate = (bot_sl['size_usd'].sum()) - abs(bot_sl['pnl'].sum()) # Примерная оценка сэкономленных средств
-        
-        print(f" - {config}: выбито по SL {len(bot_sl)} раз (потеряно {bot_sl['pnl'].sum():.2f}$). TP: {len(bot_tp)} раз.")
+        bot = merged_df[merged_df['config'] == config]
+        by_result = bot.groupby('result').agg(
+            count=('pnl', 'size'),
+            total_pnl=('pnl', 'sum'),
+            avg_pnl=('pnl', 'mean'),
+        ).round(2)
+        print(f"\n— {config}:")
+        print(by_result.to_string())
 
 if __name__ == "__main__":
     trades, market = load_and_prepare_data()

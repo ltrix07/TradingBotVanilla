@@ -31,16 +31,19 @@ def load_configs() -> list[dict]:
         print(f"[WARN] configs/ directory not found at {CONFIGS_DIR}. ")
         return []
 
-    # 🟢 БЕЛЫЙ СПИСОК: Репортер будет читать ТОЛЬКО эти файлы
+    # Whitelist: только эти конфиги попадают в отчёт.
+    # config_hybrid.yaml генерируется orchestrator'ом на лету из sniper/volume/trend.
     ALLOWED_LIST = [
-        "config_hybrid.yaml", 
-        "config_scalper.yaml", 
-        "config_balanced.yaml"
+        "config_hybrid.yaml",
+        "config_sniper.yaml",
+        "config_volume.yaml",
+        "config_trend.yaml",
+        "config_balanced.yaml",
+        "config_scalper.yaml",
     ]
 
     configs = []
     for path in sorted(CONFIGS_DIR.glob("*.yaml")):
-        # Если файла нет в белом списке - жестко игнорируем его
         if path.name not in ALLOWED_LIST:
             continue
 
@@ -76,17 +79,25 @@ def load_state(state_filepath: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def analyse_bot(cfg: dict) -> dict:
-    """Extract all metrics for one bot config. Returns a metrics dict."""
+    """Extract all metrics for one bot config. Returns a metrics dict.
+
+    Futures result codes (since Polymarket WIN/LOSS/DRAW were removed):
+      SL, TP, TIME_STOP, MAX_HOLD, REVERSE_CLOSE
+    Win/loss is determined by the sign of `pnl`, not the result code.
+    """
     strategy_name = cfg.get("strategy", {}).get("name", "Unknown")
-    
-    # 🌟 МАГИЯ ДЛЯ ДИРИЖЕРА: Если это гибридный конфиг, переименовываем его для отчета
+
+    # Orchestrator generates config_hybrid.yaml on the fly; rename for the report.
     if "hybrid" in cfg.get("_source", "").lower():
         strategy_name = "🧠 Дирижер (Hybrid)"
 
     initial_balance = cfg.get("risk_management", {}).get("initial_balance_usd", 1000.0)
-    
-    # Ищем путь к стейт-файлу в разных блоках (на случай разной структуры конфигов)
-    state_file = cfg.get("storage", {}).get("state_file") or cfg.get("simulation", {}).get("state_file", "state.json")
+
+    # State file path can live in either `simulation.state_file` or legacy `storage.state_file`
+    state_file = (
+        cfg.get("storage", {}).get("state_file")
+        or cfg.get("simulation", {}).get("state_file", "state.json")
+    )
 
     state = load_state(state_file)
 
@@ -104,39 +115,39 @@ def analyse_bot(cfg: dict) -> dict:
     pnl_pct = (pnl / initial_balance * 100) if initial_balance else 0.0
 
     history = state.get("trade_history", [])
-    wins = sum(1 for t in history if t.get("result") == "WIN")
-    losses = sum(1 for t in history if t.get("result") == "LOSS")
-    draws = sum(1 for t in history if t.get("result") == "DRAW")
-    time_stops = sum(1 for t in history if t.get("result") == "TIME_STOP")
-    rev_closes = sum(1 for t in history if t.get("result") == "REVERSE_CLOSE")
 
-    tp_count = sum(1 for t in history if t.get("result") == "TP")
-    sl_count = sum(1 for t in history if t.get("result") == "SL")
+    # Result-code breakdown
+    tp_count        = sum(1 for t in history if t.get("result") == "TP")
+    sl_count        = sum(1 for t in history if t.get("result") == "SL")
+    time_stops      = sum(1 for t in history if t.get("result") == "TIME_STOP")
+    max_holds       = sum(1 for t in history if t.get("result") == "MAX_HOLD")
+    rev_closes      = sum(1 for t in history if t.get("result") == "REVERSE_CLOSE")
 
-    tp_wins = sum(1 for t in history if t.get("result") == "TP" and t.get("pnl", 0) > 0)
-    sl_wins = sum(1 for t in history if t.get("result") == "SL" and t.get("pnl", 0) > 0)
-    total_decided = wins + losses + tp_count + sl_count
-    total_wins = wins + tp_wins + sl_wins
-    win_rate = (total_wins / total_decided * 100) if total_decided else 0.0
+    # Win-rate by pnl sign — result code alone isn't reliable for futures
+    # (e.g., TIME_STOP can close a position in profit or at a small loss).
+    total_trades = len(history)
+    winning      = sum(1 for t in history if t.get("pnl", 0.0) > 0)
+    losing       = sum(1 for t in history if t.get("pnl", 0.0) < 0)
+    breakeven    = total_trades - winning - losing
+    win_rate     = (winning / total_trades * 100) if total_trades else 0.0
 
-    # 🚨 HEALTH CHECK: Проверяем, не завис ли бот (если стейт не обновлялся больше 20 минут)
+    # Health check: state not updated > 20 min → likely stopped
     is_dead = False
     last_update_str = portfolio.get("last_update")
     if last_update_str:
         try:
             last_update = datetime.fromisoformat(last_update_str)
-            # Сравниваем с текущим временем UTC
             if (datetime.now(timezone.utc) - last_update).total_seconds() > 20 * 60:
                 is_dead = True
         except ValueError:
             pass
 
     active = portfolio.get("active_position")
-    
+
     if is_dead:
         status_str = "🔴 ОСТАНОВЛЕН (Нет связи / Пауза)"
     elif active:
-        side = active.get("side", "?")
+        side = active.get("side", "?")  # now LONG/SHORT
         status_str = f"📈 В сделке ({side})"
     else:
         status_str = "⏳ Ожидание"
@@ -147,12 +158,16 @@ def analyse_bot(cfg: dict) -> dict:
         "balance": balance,
         "pnl": pnl,
         "pnl_pct": pnl_pct,
-        "wins": wins,
-        "losses": losses,
-        "draws": draws,
-        "time_stops": time_stops,
-        "rev_closes": rev_closes,
+        "total_trades": total_trades,
+        "winning": winning,
+        "losing": losing,
+        "breakeven": breakeven,
         "win_rate": win_rate,
+        "tp_count": tp_count,
+        "sl_count": sl_count,
+        "time_stops": time_stops,
+        "max_holds": max_holds,
+        "rev_closes": rev_closes,
         "status": status_str,
         "available": True,
     }
@@ -174,7 +189,7 @@ def build_report(bots: list[dict]) -> str:
     available.sort(key=lambda b: b["pnl"], reverse=True)
 
     lines = [
-        "📊 *Polymarket Алготрейдинг | Сводка*",
+        "📊 *Crypto Futures Алготрейдинг | Сводка*",
         f"⏱ {date_str}",
         "",
     ]
@@ -188,20 +203,32 @@ def build_report(bots: list[dict]) -> str:
 
     for i, bot in enumerate(available, start=1):
         pnl_sign = "+" if bot["pnl"] >= 0 else ""
-        pnl_str = f"{pnl_sign}${bot['pnl']:.2f}"
         pnl_pct_str = f"{pnl_sign}{bot['pnl_pct']:.2f}%"
-        win_icon = "🟢" if bot["wins"] > 0 else ""
-        loss_icon = "🔴" if bot["losses"] > 0 else ""
-        draw_icon = "⚪" if bot.get("draws", 0) > 0 else ""
 
-        draw_str = f" | {bot.get('draws', 0)} {draw_icon}" if bot.get("draws", 0) > 0 else ""
-        ts_str = f" | {bot.get('time_stops', 0)} ⏱" if bot.get("time_stops", 0) > 0 else ""
-        rc_str = f" | {bot.get('rev_closes', 0)} 🔄" if bot.get("rev_closes", 0) > 0 else ""
+        # Trade breakdown: winning/losing by PnL sign + exit-code counters
+        win_icon = "🟢" if bot["winning"] > 0 else ""
+        loss_icon = "🔴" if bot["losing"] > 0 else ""
+        be_str = f" | {bot['breakeven']} ⚪" if bot.get("breakeven", 0) > 0 else ""
+
+        # Exit-code markers (only show non-zero, to keep the line compact)
+        extra = []
+        if bot.get("tp_count", 0) > 0:
+            extra.append(f"{bot['tp_count']} TP")
+        if bot.get("sl_count", 0) > 0:
+            extra.append(f"{bot['sl_count']} SL")
+        if bot.get("time_stops", 0) > 0:
+            extra.append(f"{bot['time_stops']} ⏱")
+        if bot.get("max_holds", 0) > 0:
+            extra.append(f"{bot['max_holds']} ⏰")
+        if bot.get("rev_closes", 0) > 0:
+            extra.append(f"{bot['rev_closes']} 🔄")
+        extra_str = (" | " + ", ".join(extra)) if extra else ""
+
         lines += [
             f"🤖 *{i}. {bot['name']}*",
             f"├ 💰 Баланс: ${bot['balance']:.2f} ({pnl_pct_str})",
             f"├ 🎯 Win Rate: {bot['win_rate']:.0f}% "
-            f"({bot['wins']} {win_icon} | {bot['losses']} {loss_icon}{draw_str}{ts_str}{rc_str})",
+            f"({bot['winning']} {win_icon} | {bot['losing']} {loss_icon}{be_str}){extra_str}",
             f"└ 🔄 Статус: {bot['status']}",
             "",
         ]

@@ -1,20 +1,20 @@
 """
 risk.py — Risk Management for Crypto Futures Paper Trading.
+
 Risk Management is absolute priority — all trading decisions pass through here.
 
-[REFACTORED] Adapted from Polymarket binary token model to classical futures (Long/Short).
-
-Key changes:
-  - get_exit_price():         LONG→best_bid, SHORT→best_ask  (was YES→bid, NO→1-ask)
-  - check_sl_tp():            Direction-aware SL/TP checks for LONG/SHORT
-  - update_trailing_stop():   Futures-aware trail (floor for LONG, ceiling for SHORT);
-                              raw ATR in price units replaces Polymarket-normalized ATR;
-                              breakeven_atr_multiplier snaps stop to entry_price.
-  - calculate_position_size():Risk-based sizing: qty = risk_usd / sl_distance_price
-                              (replaces fixed position_size_pct method)
-  - normalize_atr():          Returns atr/price fraction (removed Polymarket *9 scaling)
-  - update_halt_if_needed():  Halt until 00:00 UTC next day (was now+24h)
-  - should_open_trade():      Uses risk_per_trade_pct (falls back to position_size_pct)
+Exports:
+  calculate_atr            — Average True Range from OHLCV candles
+  normalize_atr            — ATR as a fraction of price (atr_raw / price)
+  compute_dynamic_sl_tp    — ATR-based SL/TP percentages (overrides config fixed values)
+  get_exit_price           — LONG → best_bid, SHORT → best_ask
+  update_trailing_stop     — ratcheting stop (floor for LONG, ceiling for SHORT) +
+                              optional breakeven snap after N×ATR profit
+  check_sl_tp              — direction-aware SL/TP/trailing-stop trigger
+  should_open_trade        — gate: no open pos, not halted, cooldown ok, balance ok
+  calculate_position_size  — risk-based sizing: size_usd = risk_usd / sl_pct
+  is_trading_halted        — read halt flag
+  update_halt_if_needed    — set halt until 00:00 UTC next day on daily-loss breach
 """
 
 from datetime import datetime, timezone, timedelta
@@ -60,12 +60,10 @@ def normalize_atr(
 ) -> float:
     """Convert raw ATR (in price units) to a relative fraction of entry price.
 
-    [CHANGED] For futures: normalized = atr_raw / last_close
-    (e.g., ATR=800 at BTC=80,000 → 0.01 = 1% per bar move)
+    Formula: normalized = atr_raw / last_close
+    Example: ATR=800 at BTC=80,000 → 0.01 (1% per bar move)
 
-    Previously multiplied by 9 for Polymarket 0–1 token scale — removed.
     This fraction is passed directly to compute_dynamic_sl_tp().
-
     Clamped to [0.001, 0.20] (0.1%–20% of price) to prevent extreme values.
     """
     fallback_price = (cfg or {}).get("risk_management", {}).get(
@@ -112,9 +110,8 @@ def compute_dynamic_sl_tp(
 def get_exit_price(position: dict, best_bid: float, best_ask: float) -> float:
     """Get the realistic exit price for an open futures position.
 
-    [CHANGED] Futures mechanics replace Polymarket token math:
-      LONG  exits by selling into the bid → best_bid
-      SHORT exits by buying back at the ask → best_ask
+    LONG  exits by selling into the bid → best_bid
+    SHORT exits by buying back at the ask → best_ask
     """
     if position["side"] == "LONG":
         return best_bid
@@ -128,13 +125,13 @@ def update_trailing_stop(
     position: dict,
     best_bid: float,
     best_ask: float,
-    atr: float | None,    # [CHANGED] Raw ATR in price units (e.g., USD for BTC)
+    atr: float | None,    #    Raw ATR in price units (e.g., USD for BTC)
     cfg: dict,
     ws_extremums: dict | None = None,
 ) -> dict:
     """Update trailing stop price and enforce breakeven for futures positions.
 
-    [CHANGED] Futures-aware direction logic:
+    Futures-aware direction logic:
 
     LONG (stop is a price FLOOR — triggers when price drops below it):
       - Uses best_bid (or ws_extremums["highest_bid"]) as the peak price.
@@ -148,10 +145,10 @@ def update_trailing_stop(
       - Breakeven: if profit >= breakeven_atr_multiplier * atr, snap stop
         to entry_price. After activation, stop cannot rise above entry_price.
 
-    [CHANGED] trail_dist = trailing_stop_atr_multiplier * atr (raw USD distance).
+    trail_dist = trailing_stop_atr_multiplier * atr (raw USD distance).
     Clamped to [0.5%, 20%] of entry price. Fallback: 3% of entry when ATR absent.
 
-    [NEW] Breakeven logic (config: breakeven_atr_multiplier):
+    Breakeven logic (config: breakeven_atr_multiplier):
       When set to 0 or absent, breakeven is disabled.
       Sets position["breakeven_activated"] = True on first trigger.
     """
@@ -250,7 +247,7 @@ def check_sl_tp(
 ) -> Optional[str]:
     """Check whether the active futures position has hit Stop-Loss or Take-Profit.
 
-    [CHANGED] Direction-aware checks for LONG/SHORT (replaces YES/NO logic).
+    Direction-aware checks for LONG/SHORT positions.
 
     Priority order:
       1. Trailing stop:
@@ -276,7 +273,7 @@ def check_sl_tp(
     risk_cfg = (cfg or {}).get("risk_management", {})
     side     = position.get("side", "LONG")
 
-    # [CHANGED] Exit price: LONG sells at bid, SHORT buys back at ask
+    #    Exit price: LONG sells at bid, SHORT buys back at ask
     exit_price = best_bid if side == "LONG" else best_ask
 
     # 1. Trailing stop check
@@ -309,26 +306,23 @@ def check_sl_tp(
 
 def should_open_trade(
     portfolio: dict,
-    seconds_until_expiry: float,
-    cfg: dict,
+    cfg: dict | None = None,
 ) -> bool:
     """Return True only if all conditions allow opening a new trade.
 
-    [CHANGED] Uses risk_per_trade_pct for minimum balance check,
+    Uses risk_per_trade_pct for minimum balance check,
     falls back to position_size_pct if risk_per_trade_pct is absent.
 
     Conditions:
     - No active position exists.
     - Trading is not halted (prop firm daily loss limit).
-    - Market has sufficient time before expiry.
     - Balance is sufficient (positive after applying risk pct).
     - Cooldown after last SL has elapsed (if configured).
     """
+    cfg = cfg or {}
     risk_cfg = cfg.get("risk_management", {})
-    min_time = risk_cfg.get("min_time_before_expiry_sec", 30)
-    max_time = risk_cfg.get("max_time_before_expiry_sec", 600)
 
-    # [CHANGED] Prefer risk_per_trade_pct; fall back to position_size_pct
+    # Prefer risk_per_trade_pct; fall back to position_size_pct
     risk_pct = float(
         risk_cfg.get("risk_per_trade_pct", risk_cfg.get("position_size_pct", 0.01))
     )
@@ -336,10 +330,6 @@ def should_open_trade(
     if portfolio.get("active_position") is not None:
         return False
     if is_trading_halted(portfolio):
-        return False
-    if seconds_until_expiry > max_time:
-        return False
-    if seconds_until_expiry < min_time:
         return False
     if portfolio.get("balance_usd", 0.0) * risk_pct <= 0:
         return False
@@ -365,7 +355,7 @@ def calculate_position_size(
 ) -> float:
     """Return notional position size in USD (qty * entry_price).
 
-    [CHANGED] Risk-based sizing (futures standard):
+    Risk-based sizing (futures standard):
       risk_usd          = balance * risk_per_trade_pct
       sl_distance_price = entry_price * sl_pct
       qty               = risk_usd / sl_distance_price
@@ -411,10 +401,10 @@ def is_trading_halted(portfolio: dict) -> bool:
 def update_halt_if_needed(portfolio: dict, cfg: dict) -> dict:
     """Set trading_halted_until to 00:00 UTC next day if daily_pnl breaches max loss.
 
-    [CHANGED] Uses initial_balance_usd (not current balance) as reference — this is
+    Uses initial_balance_usd (not current balance) as reference — this is
     the prop firm standard: daily loss limit is fixed at session start, not floating.
 
-    [CHANGED] Halt expires at 00:00 UTC next day (was now + 24h) so the trading
+    Halt expires at 00:00 UTC next day (was now + 24h) so the trading
     day boundary aligns with the UTC calendar reset.
     """
     risk_cfg           = cfg.get("risk_management", {})

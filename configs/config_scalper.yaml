@@ -1,25 +1,30 @@
 # ============================================================
 # SCALPER — Maximum Trade Frequency
 # ============================================================
-# Philosophy: Trade often, catch every micro-momentum shift.
-# Ultra-fast MACD catches crossovers every 3-8 minutes.
-# Minimal filters — let risk management handle losers.
-# Small positions (3%) compensate for high frequency.
-# Expected: 8-15+ trades/day, ~48-52% win rate,
-#   profit comes from volume + tight SL cutting losses fast.
+# Philosophy: Trade often, catch micro-momentum shifts. Ultra-fast MACD
+# triggers frequently. Minimal filters; let risk management handle losers.
+# Small position size compensates for high frequency.
+#
+# WARNING: Binance Futures fees at ~0.05% round-trip × 10 trades/day =
+# ~0.5%/day friction. A winning scalper needs edge > 0.5% per trade on
+# average just to break even vs. fees — keep an eye on net PnL, not win rate.
+#
+# Expected: 8–15+ trades/day on BTCUSDT perp.
+# Works best during high-volatility sessions; avoid overnight quiet hours.
 # ============================================================
 
-market:
-  token_id: ""
-  polling_interval_seconds: 8
-  network: "polygon-mainnet"
+execution:
+  mode: "paper"
 
-discovery:
-  enabled: true
-  query: "Bitcoin Up or Down"
-  coin_slug_prefix: "btc-"
-  limit: 50
-  gamma_api: "https://gamma-api.polymarket.com"
+exchange:
+  name: "binance_futures"
+  symbol: "BTCUSDT"
+  leverage: 5
+  margin_mode: "isolated"
+  testnet: false
+
+market:
+  polling_interval_seconds: 8    # tighter polling for faster reactions
 
 strategy:
   name: "Scalper"
@@ -32,39 +37,50 @@ strategy:
     - name: "MACD"
       source: "pandas_ta"
     - name: "PriceSource"
-      api: "Binance-REST"
+      api: "Binance-Futures-REST"
   rsi:
     period: 10
-    overbought: 75          # Very relaxed — only block at true extremes
+    overbought: 75               # very relaxed — block only at true extremes
     oversold: 25
   order_book:
-    imbalance_threshold: 0.51   # Minimal filter — almost any imbalance passes
+    imbalance_threshold: 0.51    # minimal filter — almost any imbalance passes
     depth_levels: 5
   entry_filters:
-    trend_ema_period: 30         # Only trade in direction of EMA30 trend
+    trend_ema_period: 45         # 45 min — short trend filter for fast strategy
 
 risk_management:
   initial_balance_usd: 1000.0
-  risk_per_trade_pct: 0.01      # Рискуем строго 1% в сделке
-  max_daily_loss_pct: 0.04      # Дневной лимит 4%
-  min_time_before_expiry_sec: 90
-  max_time_before_expiry_sec: 350
+  risk_per_trade_pct: 0.007      # smaller — high frequency, smaller bets
+  position_size_pct: 0.03
+  max_daily_loss_pct: 0.04
 
-  use_sl_tp: true               # Включено для фьючерсов
+  use_sl_tp: true
   use_hard_tp: true
   use_hard_sl: true
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 3.0        
-  atr_tp_multiplier: 4.5        
+  atr_sl_multiplier: 2.5         # tighter SL for scalping
+  atr_tp_multiplier: 3.5         # R:R still 1.4 — leaves room after fees
 
-  sl_confirm_seconds: 10        # Быстрый выход для скальпера
-  cooldown_after_sl_sec: 20     # Быстрый перезаход для скальпера
+  stop_loss_pct:   0.025
+  take_profit_pct: 0.035
+
+  sl_confirm_seconds: 10         # fast confirmation
+  cooldown_after_sl_sec: 20      # quick re-entry
 
   trailing_stop_enabled: true
-  trailing_stop_atr_multiplier: 1.5
-  breakeven_atr_multiplier: 1.0 # Перевод в безубыток
+  trailing_stop_atr_multiplier: 1.2
+  breakeven_atr_multiplier: 0.8  # earlier breakeven to protect small gains
+
+  max_hold_time_minutes: 45      # scalper doesn't hold
+  use_time_stop: true
+  time_stop_seconds: 300         # 5 min dead-zone cutoff
+  time_stop_max_loss_pct: 0.003
+  use_reverse_close: true
+
+  max_funding_rate_bps: 40       # scalper feels funding less (short holds) — lenient
+  btc_price_fallback: 90000.0
 
 trading:
   use_ws: true
@@ -74,15 +90,17 @@ trading:
 
 simulation:
   state_file: "state_scalper.json"
-  log_file: "trades_scalper.csv"
-  slippage_simulation_pct: 0.001
-  fee_simulation_pct: 0.000
-  market_impact_factor: 0.002
-  liquidity_fallback_usd: 1000.0
-  partial_fill_min_pct: 0.85
+  log_file:   "trades_scalper.csv"
+  fee_simulation_pct:      0.0005
+  slippage_simulation_pct: 0.0003
+  market_impact_factor:    0.0005
+  liquidity_fallback_usd:  50000.0
+  partial_fill_min_pct:    0.90
 
 endpoints:
-  polymarket_clob: "https://clob.polymarket.com"
-  binance_v3: "https://api.binance.com/api/v3"
-  telegram_bot_token: "8602019058:AAFaJkXq2Uj8OyxC4lJ5dze1gf0fp5KDr6w"
-  telegram_chat_id: "324521546"
+  binance_futures:    "https://fapi.binance.com"
+  binance_futures_ws: "wss://fstream.binance.com"
+  telegram_bot_token: ""
+  telegram_chat_id:   ""
+  # Claude Opus 4.7 API key for daily review (prefer env var ANTHROPIC_API_KEY)
+  anthropic_api_key:  ""

@@ -1,25 +1,26 @@
 # ============================================================
 # BALANCED — Golden Middle
 # ============================================================
-# Philosophy: Classic MACD with meaningful confirmations.
-# Moderate frequency — not too picky, not too loose.
-# Standard position sizing with balanced R:R ratio (1:1.7).
-# Book imbalance at 0.55 adds real confirmation value.
-# Expected: 4-8 trades/day, ~52-55% win rate,
-#   consistent performance across market conditions.
+# Philosophy: Classic MACD with meaningful confirmations. Moderate
+# frequency, not too picky nor too loose. Book imbalance at 0.55
+# gives real confirmation. R:R 1:1.5 via ATR multipliers.
+#
+# Expected: 4–8 trades/day on BTCUSDT perp.
+# Works as a "default" config when unsure which regime the market is in.
 # ============================================================
 
-market:
-  token_id: ""
-  polling_interval_seconds: 10
-  network: "polygon-mainnet"
+execution:
+  mode: "paper"
 
-discovery:
-  enabled: true
-  query: "Bitcoin Up or Down"
-  coin_slug_prefix: "btc-"
-  limit: 50
-  gamma_api: "https://gamma-api.polymarket.com"
+exchange:
+  name: "binance_futures"
+  symbol: "BTCUSDT"
+  leverage: 5
+  margin_mode: "isolated"
+  testnet: false
+
+market:
+  polling_interval_seconds: 10
 
 strategy:
   name: "Balanced"
@@ -32,39 +33,50 @@ strategy:
     - name: "MACD"
       source: "pandas_ta"
     - name: "PriceSource"
-      api: "Binance-REST"
+      api: "Binance-Futures-REST"
   rsi:
     period: 14
     overbought: 68
     oversold: 32
   order_book:
-    imbalance_threshold: 0.55   # Meaningful confirmation — needs real buying/selling pressure
+    imbalance_threshold: 0.55
     depth_levels: 5
   entry_filters:
-    trend_ema_period: 50         # Only trade in direction of EMA50 trend
+    trend_ema_period: 75      # 1.25h trend — balanced filter strength
 
 risk_management:
   initial_balance_usd: 1000.0
-  risk_per_trade_pct: 0.01      # Рискуем строго 1% в сделке
-  max_daily_loss_pct: 0.04      # Дневной лимит 4%
-  min_time_before_expiry_sec: 100
-  max_time_before_expiry_sec: 400
+  risk_per_trade_pct: 0.01
+  position_size_pct: 0.05
+  max_daily_loss_pct: 0.04
 
-  use_sl_tp: true               # Включено для фьючерсов
+  use_sl_tp: true
   use_hard_tp: true
   use_hard_sl: true
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 3.0        
-  atr_tp_multiplier: 4.5        
+  atr_sl_multiplier: 3.0
+  atr_tp_multiplier: 4.5
 
-  sl_confirm_seconds: 15        
+  stop_loss_pct:   0.03
+  take_profit_pct: 0.045
+
+  sl_confirm_seconds: 15
   cooldown_after_sl_sec: 45
 
   trailing_stop_enabled: true
   trailing_stop_atr_multiplier: 1.5
-  breakeven_atr_multiplier: 1.0 # Перевод в безубыток
+  breakeven_atr_multiplier: 1.0
+
+  max_hold_time_minutes: 120
+  use_time_stop: true
+  time_stop_seconds: 900
+  time_stop_max_loss_pct: 0.005
+  use_reverse_close: true
+
+  max_funding_rate_bps: 50
+  btc_price_fallback: 90000.0
 
 trading:
   use_ws: true
@@ -74,16 +86,17 @@ trading:
 
 simulation:
   state_file: "state_balanced.json"
-  log_file: "trades_balanced.csv"
-  slippage_simulation_pct: 0.001
-  fee_simulation_pct: 0.000
-  market_impact_factor: 0.002
-  liquidity_fallback_usd: 1000.0
-  partial_fill_min_pct: 0.85
+  log_file:   "trades_balanced.csv"
+  fee_simulation_pct:      0.0005
+  slippage_simulation_pct: 0.0003
+  market_impact_factor:    0.0005
+  liquidity_fallback_usd:  50000.0
+  partial_fill_min_pct:    0.90
 
 endpoints:
-  polymarket_clob: "https://clob.polymarket.com"
-  binance_v3: "https://api.binance.com/api/v3"
-  telegram_bot_token: "8602019058:AAFaJkXq2Uj8OyxC4lJ5dze1gf0fp5KDr6w"
-  telegram_chat_id: "324521546"
-  proxy: "http://skotarenko13802NDV:mrmcIFWs2S@194.35.226.36:50100"
+  binance_futures:    "https://fapi.binance.com"
+  binance_futures_ws: "wss://fstream.binance.com"
+  telegram_bot_token: ""
+  telegram_chat_id:   ""
+  # Claude Opus 4.7 API key for daily review (prefer env var ANTHROPIC_API_KEY)
+  anthropic_api_key:  ""
