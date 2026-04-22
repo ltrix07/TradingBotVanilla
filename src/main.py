@@ -343,15 +343,34 @@ async def _iteration(
     state = load_state(cfg)
 
     initial = float(cfg.get("risk_management", {}).get("initial_balance_usd", 1000.0))
-    current = state["virtual_portfolio"].get("balance_usd", 0.0)
-    if current < initial * 0.05:
+    portfolio_snap = state["virtual_portfolio"]
+    current = portfolio_snap.get("balance_usd", 0.0)
+
+    # Equity = free balance + margin locked in any open position.
+    # Without this adjustment, opening a leveraged position makes balance_usd
+    # look catastrophically low (margin is deducted on open) and the kill-switch
+    # fires falsely before the position has a chance to close. Unrealized PnL is
+    # bounded by the SL, so excluding it is safe for the 95% drawdown trigger —
+    # realized losses still land on balance_usd via close_position.
+    pos_snap = portfolio_snap.get("active_position")
+    locked_margin = 0.0
+    if pos_snap is not None:
+        # margin_usd is populated by execution.open_position; for state files
+        # written before the leverage-accounting fix we fall back to size_usd
+        # (which was the amount actually deducted under the old code path).
+        locked_margin = float(
+            pos_snap.get("margin_usd", pos_snap.get("size_usd", 0.0))
+        )
+    equity = current + locked_margin
+
+    if equity < initial * 0.05:
         _print_status_newline()
         log.error(
             "\033[1m\033[31mCRITICAL: More than 95%% of deposit lost "
-            "(remaining $%.2f). Halting.\033[0m",
-            current,
+            "(equity $%.2f, balance $%.2f). Halting.\033[0m",
+            equity, current,
         )
-        _notify_telegram_drawdown(cfg, current)
+        _notify_telegram_drawdown(cfg, equity)
         sys.exit(0)
 
     state = reset_daily_pnl_if_needed(state)

@@ -86,21 +86,34 @@ def compute_dynamic_sl_tp(
     Example: atr_pct=0.01, sl_mult=3.0 → sl_pct=0.03 (SL at -3% from entry)
 
     Falls back to config stop_loss_pct / take_profit_pct when ATR is unavailable.
+
+    A minimum sl_pct floor (risk_management.min_sl_pct, default 0.005 = 0.5%)
+    prevents risk-based sizing from exploding during low-volatility windows
+    (size_usd = risk_usd / sl_pct). When the floor kicks in, tp_pct is scaled
+    by the same factor so the configured risk:reward ratio is preserved.
+
     Returns (sl_pct, tp_pct) as fractions (e.g., 0.03 = 3%).
     """
     risk_cfg = cfg.get("risk_management", {})
     use_atr  = risk_cfg.get("use_atr_dynamic", True)
     base_sl  = float(risk_cfg.get("stop_loss_pct",   0.03))
     base_tp  = float(risk_cfg.get("take_profit_pct", 0.045))
+    min_sl   = float(risk_cfg.get("min_sl_pct", 0.005))
 
     if not use_atr or atr_normalized is None:
-        return base_sl, base_tp
+        return max(base_sl, min_sl), base_tp
 
     sl_mult = float(risk_cfg.get("atr_sl_multiplier", 3.0))
     tp_mult = float(risk_cfg.get("atr_tp_multiplier", 4.5))
 
     sl_pct = atr_normalized * sl_mult
     tp_pct = atr_normalized * tp_mult
+
+    # Floor sl_pct and scale tp_pct proportionally to preserve R:R.
+    if sl_pct < min_sl and sl_pct > 0:
+        scale  = min_sl / sl_pct
+        sl_pct = min_sl
+        tp_pct = tp_pct * scale
 
     return sl_pct, tp_pct
 
@@ -365,6 +378,10 @@ def calculate_position_size(
       → risk_usd = 10 USD, qty = 10/2400 = 0.00417 BTC, size_usd = 333 USD
       If SL hit: loss = qty * 2400 = 10 USD = 1% of balance ✓
 
+    Hard cap: size_usd is clamped to balance * leverage * size_cap_leverage_factor
+    (default 0.9) so tiny sl_pct from low-volatility ATR cannot produce a notional
+    that exceeds the margin the account can actually support.
+
     Falls back to balance * position_size_pct when:
       - risk_per_trade_pct is not in config, OR
       - entry_price or sl_pct are not provided (legacy callers).
@@ -372,15 +389,26 @@ def calculate_position_size(
     risk_cfg           = cfg.get("risk_management", {})
     balance            = portfolio.get("balance_usd", 0.0)
     risk_per_trade_pct = risk_cfg.get("risk_per_trade_pct")
+    leverage           = float(cfg.get("exchange", {}).get("leverage", 1.0) or 1.0)
+    if leverage <= 0:
+        leverage = 1.0
+    safety_factor      = float(risk_cfg.get("size_cap_leverage_factor", 0.9))
+    max_notional       = balance * leverage * safety_factor if balance > 0 else 0.0
 
     if risk_per_trade_pct is not None and entry_price > 0 and sl_pct > 0:
         risk_usd = balance * float(risk_per_trade_pct)
         # size_usd = risk_usd / sl_pct  (algebraically: qty*entry = (risk/sl_dist)*entry)
-        return risk_usd / float(sl_pct)
+        size_usd = risk_usd / float(sl_pct)
+        if max_notional > 0:
+            size_usd = min(size_usd, max_notional)
+        return size_usd
 
     # Legacy fallback: fixed percentage of balance
     position_size_pct = float(risk_cfg.get("position_size_pct", 0.05))
-    return balance * position_size_pct
+    size_usd = balance * position_size_pct
+    if max_notional > 0:
+        size_usd = min(size_usd, max_notional)
+    return size_usd
 
 
 # ── Daily loss halt ───────────────────────────────────────────────────────────
