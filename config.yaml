@@ -61,6 +61,8 @@ risk_management:
   atr_period: 14
   atr_sl_multiplier: 3.0
   atr_tp_multiplier: 4.5
+  min_atr_pct: 0.0025           # Фикс A: skip if ATR < 0.25%
+  min_sl_pct: 0.008            # Фикс C: minimum SL floor = 0.8%
 
   stop_loss_pct:   0.03
   take_profit_pct: 0.045

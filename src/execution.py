@@ -7,14 +7,8 @@ Simulates crypto futures (Long/Short) trading in paper mode:
   Fee:   charged on exit notional → fee_pct * exit_price * qty
 
 Balance accounting (paper mode):
-  open  — balance_usd -= margin_usd              (margin = notional / leverage)
-  close — balance_usd += margin_usd + net_pnl    (margin returned ± PnL)
-
-  Leverage is read from cfg["exchange"]["leverage"] (default 1). This matches
-  how real futures exchanges lock only the initial margin, not the full notional.
-  Backward-compat: positions opened before this fix lack a "margin_usd" field;
-  close_position falls back to "size_usd" so the pre-fix notional deduction is
-  correctly refunded on close.
+  open  — balance_usd -= filled_size_usd (margin deducted)
+  close — balance_usd += filled_size_usd + net_pnl (margin returned ± PnL)
 
 Prop Firm Daily Drawdown Guard:
   After each close, if daily_pnl <= -(initial_balance_usd * max_daily_loss_pct),
@@ -255,16 +249,8 @@ def open_position(
     if sl_pct is None or tp_pct is None:
         sl_pct, tp_pct = compute_dynamic_sl_tp(None, cfg)
 
-    # Margin on a leveraged futures position = notional / leverage.
-    # Using leverage=1 (i.e. margin == notional) when leverage is absent/invalid
-    # keeps spot-style accounting for older configs.
-    leverage = float(cfg.get("exchange", {}).get("leverage", 1.0) or 1.0)
-    if leverage <= 0:
-        leverage = 1.0
-    margin_usd = filled_size_usd / leverage
-
     portfolio = state["virtual_portfolio"]
-    portfolio["balance_usd"] -= margin_usd
+    portfolio["balance_usd"] -= filled_size_usd
     portfolio["active_position"] = {
         "id":                    str(uuid.uuid4()),
         "side":                  side,             # "LONG" or "SHORT"
@@ -272,8 +258,6 @@ def open_position(
         "entry_price":           fill_price,
         "qty":                   qty,
         "size_usd":              filled_size_usd,
-        "margin_usd":            round(margin_usd, 6),
-        "leverage":              leverage,
         "requested_size_usd":    size_usd,
         "fill_pct":              round(fill_pct, 4),
         "sl_pct":                round(sl_pct, 4),
@@ -360,12 +344,8 @@ def close_position(
     fee     = fee_pct * actual_exit_price * qty
     net_pnl = pnl_gross - fee
 
-    # Return the deducted margin + net PnL (can be negative on a losing trade).
-    # Backward-compat: positions opened before the leverage-accounting fix do
-    # not carry "margin_usd"; for those, the full notional was deducted on open,
-    # so we refund "size_usd" to keep the books balanced.
-    margin_usd = float(position.get("margin_usd", size_usd))
-    portfolio["balance_usd"] += margin_usd + net_pnl
+    # Return the deducted margin + net PnL (can be negative on a losing trade)
+    portfolio["balance_usd"] += size_usd + net_pnl
     portfolio["daily_pnl"]   += net_pnl
 
     # ── Prop Firm Daily Drawdown Guard ───────────────────────────────────────

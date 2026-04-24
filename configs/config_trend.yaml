@@ -77,6 +77,8 @@ risk_management:
   atr_period: 14
   atr_sl_multiplier: 3.0       # SL = 3 × ATR beyond entry
   atr_tp_multiplier: 4.5       # TP = 4.5 × ATR (R:R ≈ 1.5)
+  min_atr_pct: 0.0025           # Фикс A: skip if ATR < 0.25%
+  min_sl_pct: 0.008            # Фикс C: minimum SL floor = 0.8%
 
   # Used only when use_atr_dynamic is false
   stop_loss_pct:   0.03

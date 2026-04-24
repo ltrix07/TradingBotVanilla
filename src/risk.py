@@ -74,6 +74,22 @@ def normalize_atr(
     return max(0.001, min(normalized, 0.20))
 
 
+def atr_below_minimum(atr_normalized: float | None, cfg: dict) -> bool:
+    """Return True if ATR is too low for meaningful trading (flat market).
+
+    When True the caller should skip opening a new position — the noise-to-signal
+    ratio is too high and any SL/TP would be inside the random-walk band.
+
+    Controlled by cfg["risk_management"]["min_atr_pct"] (default 0 = disabled).
+    """
+    min_atr = float(cfg.get("risk_management", {}).get("min_atr_pct", 0.0))
+    if min_atr <= 0:
+        return False  # gate disabled
+    if atr_normalized is None:
+        return False  # cannot determine — let trade through
+    return atr_normalized < min_atr
+
+
 def compute_dynamic_sl_tp(
     atr_normalized: float | None,
     cfg: dict,
@@ -86,22 +102,15 @@ def compute_dynamic_sl_tp(
     Example: atr_pct=0.01, sl_mult=3.0 → sl_pct=0.03 (SL at -3% from entry)
 
     Falls back to config stop_loss_pct / take_profit_pct when ATR is unavailable.
-
-    A minimum sl_pct floor (risk_management.min_sl_pct, default 0.005 = 0.5%)
-    prevents risk-based sizing from exploding during low-volatility windows
-    (size_usd = risk_usd / sl_pct). When the floor kicks in, tp_pct is scaled
-    by the same factor so the configured risk:reward ratio is preserved.
-
     Returns (sl_pct, tp_pct) as fractions (e.g., 0.03 = 3%).
     """
     risk_cfg = cfg.get("risk_management", {})
     use_atr  = risk_cfg.get("use_atr_dynamic", True)
     base_sl  = float(risk_cfg.get("stop_loss_pct",   0.03))
     base_tp  = float(risk_cfg.get("take_profit_pct", 0.045))
-    min_sl   = float(risk_cfg.get("min_sl_pct", 0.005))
 
     if not use_atr or atr_normalized is None:
-        return max(base_sl, min_sl), base_tp
+        return base_sl, base_tp
 
     sl_mult = float(risk_cfg.get("atr_sl_multiplier", 3.0))
     tp_mult = float(risk_cfg.get("atr_tp_multiplier", 4.5))
@@ -109,11 +118,13 @@ def compute_dynamic_sl_tp(
     sl_pct = atr_normalized * sl_mult
     tp_pct = atr_normalized * tp_mult
 
-    # Floor sl_pct and scale tp_pct proportionally to preserve R:R.
-    if sl_pct < min_sl and sl_pct > 0:
-        scale  = min_sl / sl_pct
+    # Фикс C: жёсткий минимум SL/TP — не торговать с SL внутри шумовой зоны
+    min_sl = float(risk_cfg.get("min_sl_pct", 0.008))   # default 0.8%
+    if min_sl > 0 and sl_pct < min_sl:
+        # Сохраняем R:R ratio при поднятии SL до минимума
+        min_tp = min_sl * (tp_mult / sl_mult) if sl_mult > 0 else min_sl * 1.5
         sl_pct = min_sl
-        tp_pct = tp_pct * scale
+        tp_pct = max(tp_pct, min_tp)
 
     return sl_pct, tp_pct
 
@@ -378,10 +389,6 @@ def calculate_position_size(
       → risk_usd = 10 USD, qty = 10/2400 = 0.00417 BTC, size_usd = 333 USD
       If SL hit: loss = qty * 2400 = 10 USD = 1% of balance ✓
 
-    Hard cap: size_usd is clamped to balance * leverage * size_cap_leverage_factor
-    (default 0.9) so tiny sl_pct from low-volatility ATR cannot produce a notional
-    that exceeds the margin the account can actually support.
-
     Falls back to balance * position_size_pct when:
       - risk_per_trade_pct is not in config, OR
       - entry_price or sl_pct are not provided (legacy callers).
@@ -389,26 +396,21 @@ def calculate_position_size(
     risk_cfg           = cfg.get("risk_management", {})
     balance            = portfolio.get("balance_usd", 0.0)
     risk_per_trade_pct = risk_cfg.get("risk_per_trade_pct")
-    leverage           = float(cfg.get("exchange", {}).get("leverage", 1.0) or 1.0)
-    if leverage <= 0:
-        leverage = 1.0
-    safety_factor      = float(risk_cfg.get("size_cap_leverage_factor", 0.9))
-    max_notional       = balance * leverage * safety_factor if balance > 0 else 0.0
 
     if risk_per_trade_pct is not None and entry_price > 0 and sl_pct > 0:
         risk_usd = balance * float(risk_per_trade_pct)
         # size_usd = risk_usd / sl_pct  (algebraically: qty*entry = (risk/sl_dist)*entry)
-        size_usd = risk_usd / float(sl_pct)
-        if max_notional > 0:
-            size_usd = min(size_usd, max_notional)
-        return size_usd
+        ideal_size_usd = risk_usd / float(sl_pct)
+
+        # Фикс B: cap at 50% of margin capacity — prevents over-leverage
+        # when SL is very tight (e.g. sl_pct=0.005 → size=3x balance uncapped)
+        leverage = cfg.get("exchange", {}).get("leverage", 1)
+        max_notional = balance * leverage * 0.5
+        return min(ideal_size_usd, max_notional)
 
     # Legacy fallback: fixed percentage of balance
     position_size_pct = float(risk_cfg.get("position_size_pct", 0.05))
-    size_usd = balance * position_size_pct
-    if max_notional > 0:
-        size_usd = min(size_usd, max_notional)
-    return size_usd
+    return balance * position_size_pct
 
 
 # ── Daily loss halt ───────────────────────────────────────────────────────────
