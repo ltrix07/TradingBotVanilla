@@ -210,6 +210,7 @@ class BinanceFuturesTradesFeed:
     """
 
     _RECONNECT_DELAY = 3
+    _STALE_THRESHOLD_SEC = 120  # 2 min without trades → consider feed stale
 
     def __init__(self) -> None:
         self._symbol: str = "BTCUSDT"
@@ -222,6 +223,12 @@ class BinanceFuturesTradesFeed:
         self._task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._tick_event: asyncio.Event = asyncio.Event()
+        # Diagnostics: track WS health
+        self._trade_count: int = 0
+        self._candle_close_count: int = 0
+        self._last_trade_time: float = 0.0  # monotonic timestamp of last received trade
+        self._ws_connected: bool = False
+        self._cfg: dict = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -243,6 +250,12 @@ class BinanceFuturesTradesFeed:
         self._current_candle = None
         self._last_price = None
         self._tick_event.clear()
+
+        self._cfg = cfg
+        self._trade_count = 0
+        self._candle_close_count = 0
+        self._last_trade_time = 0.0
+        self._ws_connected = False
 
         await self._bootstrap_from_rest(cfg)
         self._task = asyncio.create_task(self._listener_loop())
@@ -295,6 +308,48 @@ class BinanceFuturesTradesFeed:
         """Return the last trade price received from the WebSocket."""
         return self._last_price
 
+    def get_diagnostics(self) -> dict:
+        """Return WS feed health diagnostics for status line / debugging."""
+        import time
+        stale_sec = (
+            time.monotonic() - self._last_trade_time
+            if self._last_trade_time > 0 else -1
+        )
+        return {
+            "ws_connected": self._ws_connected,
+            "trade_count": self._trade_count,
+            "candle_closes": self._candle_close_count,
+            "stale_sec": round(stale_sec, 1),
+        }
+
+    def is_stale(self) -> bool:
+        """True when the WS feed hasn't received a trade for too long."""
+        import time
+        if self._last_trade_time <= 0:
+            return True  # never received a trade
+        return (time.monotonic() - self._last_trade_time) > self._STALE_THRESHOLD_SEC
+
+    async def refresh_from_rest(self) -> bool:
+        """Re-fetch candles from REST when WS feed is stale. Returns True on success."""
+        try:
+            rest_candles = await fetch_binance_futures_klines_async(self._cfg)
+            if not rest_candles:
+                return False
+            self._candles = rest_candles[:-1]
+            self._current_candle = rest_candles[-1]
+            self._last_price = float(rest_candles[-1]["close"])
+            if len(self._candles) > self._max_history:
+                self._candles = self._candles[-self._max_history:]
+            _log.info(
+                "TradesFeed refreshed from REST (%d candles) — WS stale for %.0fs",
+                len(self._candles),
+                self.get_diagnostics()["stale_sec"],
+            )
+            return True
+        except Exception as exc:
+            _log.warning("TradesFeed REST refresh failed: %s", exc)
+            return False
+
     async def wait_for_tick(self, timeout: Optional[float] = None) -> bool:
         """Block until the next aggTrade tick. Returns True on tick, False on timeout."""
         self._tick_event.clear()
@@ -320,7 +375,11 @@ class BinanceFuturesTradesFeed:
 
     def _process_trade(self, price: float, qty: float, timestamp_ms: int) -> None:
         """Integrate a single aggTrade event into the candle builder."""
+        import time
         self._last_price = price
+        self._trade_count += 1
+        self._last_trade_time = time.monotonic()
+
         candle_start_ms = (
             (timestamp_ms // (self._timeframe_sec * 1000))
             * (self._timeframe_sec * 1000)
@@ -330,6 +389,7 @@ class BinanceFuturesTradesFeed:
             # Close the previous candle, start a new one.
             if self._current_candle is not None:
                 self._candles.append(self._current_candle)
+                self._candle_close_count += 1
                 if len(self._candles) > self._max_history:
                     self._candles = self._candles[-self._max_history:]
 
@@ -341,6 +401,11 @@ class BinanceFuturesTradesFeed:
                 "close":     price,
                 "volume":    qty,
             }
+            if self._candle_close_count > 0 and self._candle_close_count % 10 == 0:
+                _log.info(
+                    "TradesFeed: %d candles closed, %d trades processed, %d candles in history",
+                    self._candle_close_count, self._trade_count, len(self._candles),
+                )
         else:
             c = self._current_candle
             c["high"] = max(c["high"], price)
@@ -357,11 +422,13 @@ class BinanceFuturesTradesFeed:
         while self._running:
             try:
                 async with websockets.connect(self._ws_url) as ws:
+                    self._ws_connected = True
                     _log.info("BinanceFuturesTradesFeed connected to %s", self._ws_url)
                     while self._running:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=30)
                         except asyncio.TimeoutError:
+                            _log.debug("TradesFeed: no message in 30s, still waiting…")
                             continue
 
                         try:
@@ -383,9 +450,13 @@ class BinanceFuturesTradesFeed:
 
                         self._process_trade(price, qty, trade_ts)
 
+                    self._ws_connected = False
+
             except asyncio.CancelledError:
+                self._ws_connected = False
                 return
             except Exception as exc:
+                self._ws_connected = False
                 _log.warning(
                     "BinanceFuturesTradesFeed disconnected (%s) — reconnecting in %ds",
                     exc, self._RECONNECT_DELAY,

@@ -152,6 +152,7 @@ def _print_status(
     macd_state: dict | None = None, source: str = "?",
     can_trade: bool = True, book_imbalance: float | None = None,
     trailing_stop: float | None = None,
+    ws_diag: dict | None = None,
 ) -> None:
     spread = ask - bid
 
@@ -173,12 +174,21 @@ def _print_status(
     if trailing_stop is not None:
         trail_s = f"  trail {_Y}${trailing_stop:,.2f}{_RS}"
 
+    ws_s = ""
+    if ws_diag is not None:
+        tc = ws_diag["trade_count"]
+        cc = ws_diag["candle_closes"]
+        if not ws_diag["ws_connected"] or ws_diag["stale_sec"] > 60:
+            ws_s = f"  {_R}WS-STALE{_RS}({ws_diag['stale_sec']:.0f}s)"
+        elif tc > 0:
+            ws_s = f"  ws:{tc}t/{cc}c"
+
     line = (
         f"  [{cycle:>4}]  {_W}{symbol}{_RS}"
         f"  ask {_B}${ask:,.2f}{_RS}  bid {_B}${bid:,.2f}{_RS}"
         f"  spread ${spread:.2f}"
         f"  src {_W}{source}{_RS}"
-        f"{macd_s}{imb_s}{trail_s}{trade_s}"
+        f"{macd_s}{imb_s}{trail_s}{trade_s}{ws_s}"
         f"  bal ${balance:.2f}"
     )
     print(f"\r{line}          ", end="", flush=True)
@@ -366,8 +376,19 @@ async def _iteration(
     ws_extremums = None
     use_live_candles = False
     try:
-        # Candles: prefer live WS feed
+        # Candles: prefer live WS feed, but fall back to REST if WS is stale
         if trades_feed is not None and trades_feed.is_ready():
+            if trades_feed.is_stale():
+                diag = trades_feed.get_diagnostics()
+                if cycle % 6 == 0:  # log every ~60s, not every tick
+                    _print_status_newline()
+                    log.warning(
+                        "TradesFeed stale (no trades for %.0fs, ws_connected=%s, "
+                        "total_trades=%d, candle_closes=%d) — refreshing from REST",
+                        diag["stale_sec"], diag["ws_connected"],
+                        diag["trade_count"], diag["candle_closes"],
+                    )
+                await trades_feed.refresh_from_rest()
             candles = trades_feed.get_candles()
             use_live_candles = True
             candle_source = "bnb-ws"
@@ -413,6 +434,7 @@ async def _iteration(
     macd_state = get_macd_state(candles, cfg)
     can_trade  = should_open_trade(portfolio, cfg=cfg)
     trailing   = pos.get("trailing_stop_price") if pos else None
+    ws_diag = trades_feed.get_diagnostics() if trades_feed is not None else None
     _print_status(
         symbol, best_ask, best_bid,
         portfolio["balance_usd"], cycle,
@@ -421,6 +443,7 @@ async def _iteration(
         can_trade=can_trade,
         book_imbalance=book_imbalance,
         trailing_stop=trailing,
+        ws_diag=ws_diag,
     )
 
     if portfolio.get("trading_halted_until"):
