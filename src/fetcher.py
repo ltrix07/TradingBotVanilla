@@ -194,14 +194,14 @@ def _ws_base(cfg: dict) -> str:
     ).rstrip("/")
 
 
-# ── WS: aggTrade → candles feed ───────────────────────────────────────────────
+# ── WS: kline → candles feed ─────────────────────────────────────────────────
 
 class BinanceFuturesTradesFeed:
-    """WebSocket feed that builds live OHLCV candles from Binance Futures aggTrade events.
+    """WebSocket feed that receives live OHLCV candles from Binance Futures kline stream.
 
-    Connects to wss://fstream.binance.com/ws/<symbol>@aggTrade and assembles
-    candles on-the-fly. The last candle is always "open" (not yet closed) and
-    updates with every incoming tick.
+    Connects to wss://fstream.binance.com/ws/<symbol>@kline_<interval> and
+    receives pre-built candle updates every ~1s.  When the exchange marks a
+    candle as closed (x=true), it is appended to the completed list.
 
     Usage mirrors the consumer pattern already used in main.py:
         feed = BinanceFuturesTradesFeed()
@@ -238,7 +238,8 @@ class BinanceFuturesTradesFeed:
         Bootstraps history from REST so MACD has meaningful values from cycle 1.
         """
         self._symbol = _symbol(cfg)
-        self._ws_url = f"{_ws_base(cfg)}/ws/{self._symbol.lower()}@aggTrade"
+        tf_ws = cfg.get("strategy", {}).get("timeframe", "1m")
+        self._ws_url = f"{_ws_base(cfg)}/ws/{self._symbol.lower()}@kline_{tf_ws}"
 
         trading = cfg.get("trading", {})
         self._max_history = int(trading.get("binance_ws_candle_history", 60))
@@ -250,12 +251,6 @@ class BinanceFuturesTradesFeed:
         self._current_candle = None
         self._last_price = None
         self._tick_event.clear()
-
-        self._cfg = cfg
-        self._trade_count = 0
-        self._candle_close_count = 0
-        self._last_trade_time = 0.0
-        self._ws_connected = False
 
         self._cfg = cfg
         self._trade_count = 0
@@ -379,82 +374,97 @@ class BinanceFuturesTradesFeed:
             return int(tf[:-1]) * 3600
         return 60
 
-    def _process_trade(self, price: float, qty: float, timestamp_ms: int) -> None:
-        """Integrate a single aggTrade event into the candle builder."""
+    def _process_kline(self, k: dict) -> None:
+        """Process a kline/candlestick event from the WS stream.
+
+        Kline payload 'k' keys:
+            t  — kline open time (ms)
+            o, h, l, c — OHLC prices (strings)
+            v  — volume (string)
+            x  — is this kline closed? (bool)
+        """
         import time
-        self._last_price = price
         self._trade_count += 1
         self._last_trade_time = time.monotonic()
 
-        candle_start_ms = (
-            (timestamp_ms // (self._timeframe_sec * 1000))
-            * (self._timeframe_sec * 1000)
-        )
+        try:
+            ts   = int(k["t"])
+            o    = float(k["o"])
+            h    = float(k["h"])
+            lo   = float(k["l"])
+            c    = float(k["c"])
+            vol  = float(k["v"])
+            closed = k.get("x", False)
+        except (KeyError, ValueError, TypeError) as exc:
+            _log.warning("TradesFeed: kline parse error: %s", exc)
+            return
 
-        if self._current_candle is None or self._current_candle["timestamp"] != candle_start_ms:
-            # Close the previous candle, start a new one.
-            if self._current_candle is not None:
-                self._candles.append(self._current_candle)
-                self._candle_close_count += 1
-                if len(self._candles) > self._max_history:
-                    self._candles = self._candles[-self._max_history:]
+        self._last_price = c
 
-            self._current_candle = {
-                "timestamp": candle_start_ms,
-                "open":      price,
-                "high":      price,
-                "low":       price,
-                "close":     price,
-                "volume":    qty,
-            }
-            if self._candle_close_count > 0 and self._candle_close_count % 10 == 0:
+        # Update or create the current candle
+        self._current_candle = {
+            "timestamp": ts,
+            "open":      o,
+            "high":      h,
+            "low":       lo,
+            "close":     c,
+            "volume":    vol,
+        }
+
+        if closed:
+            # Candle is finalized — move to completed list
+            self._candles.append(dict(self._current_candle))
+            self._candle_close_count += 1
+            self._current_candle = None  # will be replaced by the next kline event
+            if len(self._candles) > self._max_history:
+                self._candles = self._candles[-self._max_history:]
+            if self._candle_close_count % 10 == 0:
                 _log.info(
-                    "TradesFeed: %d candles closed, %d trades processed, %d candles in history",
+                    "TradesFeed: %d candles closed, %d kline msgs, %d in history",
                     self._candle_close_count, self._trade_count, len(self._candles),
                 )
-        else:
-            c = self._current_candle
-            c["high"] = max(c["high"], price)
-            c["low"]  = min(c["low"],  price)
-            c["close"] = price
-            c["volume"] += qty
 
         self._tick_event.set()
 
     async def _listener_loop(self) -> None:
-        """Connect, receive aggTrade frames, reconnect on error."""
-        import websockets  # deferred — guarded by _WS_AVAILABLE in main.py
+        """Connect to kline WS stream, receive candle updates, reconnect on error."""
+        import websockets  # deferred -- guarded by _WS_AVAILABLE in main.py
 
         while self._running:
             try:
                 async with websockets.connect(self._ws_url) as ws:
                     self._ws_connected = True
-                    _log.info("BinanceFuturesTradesFeed connected to %s", self._ws_url)
+                    _log.info("TradesFeed connected to %s", self._ws_url)
+                    _msg_count = 0
                     while self._running:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=30)
                         except asyncio.TimeoutError:
-                            _log.debug("TradesFeed: no message in 30s, still waiting…")
+                            _log.warning(
+                                "TradesFeed: no WS message in 30s (%d msgs received so far)",
+                                _msg_count,
+                            )
                             continue
+
+                        _msg_count += 1
+                        if _msg_count <= 3:
+                            _log.info("TradesFeed msg #%d: %.200s", _msg_count, raw if isinstance(raw, str) else str(raw))
 
                         try:
                             msg = json.loads(raw)
                         except (json.JSONDecodeError, TypeError):
                             continue
 
-                        # aggTrade event:
-                        # {"e":"aggTrade","E":ts,"s":"BTCUSDT","p":"price","q":"qty","T":trade_ts,...}
-                        if msg.get("e") != "aggTrade":
+                        # kline event: {"e":"kline","E":ts,"s":"BTCUSDT","k":{...}}
+                        if msg.get("e") != "kline":
+                            if _msg_count <= 5:
+                                _log.info("TradesFeed: msg #%d event='%s' keys=%s", _msg_count, msg.get("e"), list(msg.keys())[:10])
                             continue
 
-                        try:
-                            price = float(msg["p"])
-                            qty   = float(msg["q"])
-                            trade_ts = int(msg["T"])
-                        except (KeyError, ValueError, TypeError):
+                        k = msg.get("k")
+                        if k is None:
                             continue
-
-                        self._process_trade(price, qty, trade_ts)
+                        self._process_kline(k)
 
                     self._ws_connected = False
 
