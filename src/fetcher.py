@@ -257,6 +257,12 @@ class BinanceFuturesTradesFeed:
         self._last_trade_time = 0.0
         self._ws_connected = False
 
+        self._cfg = cfg
+        self._trade_count = 0
+        self._candle_close_count = 0
+        self._last_trade_time = 0.0
+        self._ws_connected = False
+
         await self._bootstrap_from_rest(cfg)
         self._task = asyncio.create_task(self._listener_loop())
 
