@@ -217,8 +217,25 @@ def generate_signal(
         # 1. Ищем полноценное пересечение только на закрытых свечах (защита от дергания)
         df_completed = df.iloc[:-1].copy()
         macd_signal = _compute_macd_signal(df_completed, cfg)
-        
+
         if macd_signal is None:
+            # Log MACD proximity to crossover for diagnostics
+            fast, slow, smooth = _get_macd_params(cfg)
+            _r = ta.macd(df_completed["close"], fast=fast, slow=slow, signal=smooth)
+            if _r is not None:
+                _mc = f"MACD_{fast}_{slow}_{smooth}"
+                _sc = f"MACDs_{fast}_{slow}_{smooth}"
+                if _mc in _r.columns and _sc in _r.columns:
+                    _m = _r[_mc].iloc[-1]
+                    _s = _r[_sc].iloc[-1]
+                    _pm = _r[_mc].iloc[-2]
+                    _ps = _r[_sc].iloc[-2]
+                    if pd.notna(_m) and pd.notna(_s):
+                        _gap = abs(float(_m) - float(_s))
+                        logging.debug(
+                            "No MACD crossover: prev=%.3f/%.3f curr=%.3f/%.3f gap=%.4f",
+                            float(_pm), float(_ps), float(_m), float(_s), _gap,
+                        )
             return None
             
         # 2. Проверяем, что текущая (открытая) свеча не сломала этот сигнал

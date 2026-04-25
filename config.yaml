@@ -29,9 +29,9 @@ strategy:
   name: "Default"
   timeframe: "1m"
   parameters:
-    fast_ema: 8
-    slow_ema: 21
-    signal_smoothing: 6
+    fast_ema: 6
+    slow_ema: 17
+    signal_smoothing: 5
   indicators:
     - name: "MACD"
       source: "pandas_ta"
@@ -45,7 +45,7 @@ strategy:
     imbalance_threshold: 0.55
     depth_levels: 5
   entry_filters:
-    trend_ema_period: 75
+    trend_ema_period: 50
 
 risk_management:
   initial_balance_usd: 1000.0
@@ -61,7 +61,7 @@ risk_management:
   atr_period: 14
   atr_sl_multiplier: 3.0
   atr_tp_multiplier: 4.5
-  min_atr_pct: 0.0025           # Фикс A: skip if ATR < 0.25%
+  min_atr_pct: 0.0018           # Ослаблено: skip if ATR < 0.18%
   min_sl_pct: 0.008            # Фикс C: minimum SL floor = 0.8%
 
   stop_loss_pct:   0.03

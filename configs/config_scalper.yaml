@@ -62,7 +62,7 @@ risk_management:
   atr_period: 14
   atr_sl_multiplier: 2.5         # tighter SL for scalping
   atr_tp_multiplier: 3.5         # R:R still 1.4 — leaves room after fees
-  min_atr_pct: 0.0025           # Фикс A: skip if ATR < 0.25%
+  min_atr_pct: 0.0018           # Ослаблено: skip if ATR < 0.18%
   min_sl_pct: 0.008            # Фикс C: minimum SL floor = 0.8%
 
   stop_loss_pct:   0.025

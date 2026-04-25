@@ -700,6 +700,13 @@ async def _iteration(
 
     # Фикс A: skip trading when ATR is below noise threshold
     if atr_below_minimum(atr_normalized, cfg):
+        if cycle % 30 == 0:
+            _print_status_newline()
+            log.info(
+                "DIAG: ATR below min (atr=%.6f min=%.4f) -- no signal check",
+                atr_normalized or 0,
+                float(cfg.get("risk_management", {}).get("min_atr_pct", 0)),
+            )
         save_state(state, cfg)
         return
 
@@ -707,6 +714,15 @@ async def _iteration(
         candles, cfg, book_data=book,
         is_last_candle_open=use_live_candles,
     )
+
+    if cycle % 30 == 0:
+        _print_status_newline()
+        log.info(
+            "DIAG cycle %d: signal=%s atr=%.6f macd=%.3f candles=%d live=%s",
+            cycle, signal, atr_normalized or 0,
+            macd_state.get("diff", 0) or 0, len(candles), use_live_candles,
+        )
+
     if signal is None:
         save_state(state, cfg)
         return
