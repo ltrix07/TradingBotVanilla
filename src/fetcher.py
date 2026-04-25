@@ -239,7 +239,16 @@ class BinanceFuturesTradesFeed:
         """
         self._symbol = _symbol(cfg)
         tf_ws = cfg.get("strategy", {}).get("timeframe", "1m")
-        self._ws_url = f"{_ws_base(cfg)}/ws/{self._symbol.lower()}@kline_{tf_ws}"
+        stream_name = f"{self._symbol.lower()}@kline_{tf_ws}"
+        # Use combined stream format (/stream?) as primary — more reliable on some
+        # networks than raw streams (/ws/).  Keep raw URL as fallback.
+        ws_base = _ws_base(cfg)
+        self._ws_urls = [
+            f"{ws_base}/stream?streams={stream_name}",   # combined format
+            f"{ws_base}/ws/{stream_name}",                # raw format (fallback)
+        ]
+        self._ws_url = self._ws_urls[0]
+        self._stream_name = stream_name
 
         trading = cfg.get("trading", {})
         self._max_history = int(trading.get("binance_ws_candle_history", 60))
@@ -427,38 +436,62 @@ class BinanceFuturesTradesFeed:
         self._tick_event.set()
 
     async def _listener_loop(self) -> None:
-        """Connect to kline WS stream, receive candle updates, reconnect on error."""
+        """Connect to kline WS stream, receive candle updates, reconnect on error.
+
+        Tries combined stream format first (/stream?streams=), then falls back
+        to raw stream (/ws/).  Combined streams wrap payloads in
+        {"stream": "<name>", "data": <payload>}.
+        """
         import websockets  # deferred -- guarded by _WS_AVAILABLE in main.py
 
+        url_idx = 0
         while self._running:
+            url = self._ws_urls[url_idx % len(self._ws_urls)]
+            is_combined = "/stream?" in url
             try:
-                async with websockets.connect(self._ws_url) as ws:
+                async with websockets.connect(url) as ws:
                     self._ws_connected = True
-                    _log.info("TradesFeed connected to %s", self._ws_url)
+                    _log.info("TradesFeed connected to %s (combined=%s)", url, is_combined)
                     _msg_count = 0
+                    _no_data_timeouts = 0
                     while self._running:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=15)
                         except asyncio.TimeoutError:
+                            _no_data_timeouts += 1
                             _log.warning(
-                                "TradesFeed: no WS message in 30s (%d msgs received so far)",
-                                _msg_count,
+                                "TradesFeed: no WS message in 15s on %s (%d msgs so far, timeout #%d)",
+                                url, _msg_count, _no_data_timeouts,
                             )
+                            if _no_data_timeouts >= 2 and _msg_count == 0:
+                                _log.warning("TradesFeed: switching to next URL variant")
+                                url_idx += 1
+                                break  # reconnect with next URL
                             continue
 
                         _msg_count += 1
+                        _no_data_timeouts = 0
+
                         if _msg_count <= 3:
-                            _log.info("TradesFeed msg #%d: %.200s", _msg_count, raw if isinstance(raw, str) else str(raw))
+                            snippet = raw[:300] if isinstance(raw, str) else str(raw)[:300]
+                            _log.info("TradesFeed msg #%d: %s", _msg_count, snippet)
 
                         try:
                             msg = json.loads(raw)
                         except (json.JSONDecodeError, TypeError):
                             continue
 
+                        # Combined stream wraps payload: {"stream":"...","data":{...}}
+                        if is_combined and "data" in msg:
+                            msg = msg["data"]
+
                         # kline event: {"e":"kline","E":ts,"s":"BTCUSDT","k":{...}}
                         if msg.get("e") != "kline":
                             if _msg_count <= 5:
-                                _log.info("TradesFeed: msg #%d event='%s' keys=%s", _msg_count, msg.get("e"), list(msg.keys())[:10])
+                                _log.info(
+                                    "TradesFeed: msg #%d event='%s' keys=%s",
+                                    _msg_count, msg.get("e"), list(msg.keys())[:10],
+                                )
                             continue
 
                         k = msg.get("k")
