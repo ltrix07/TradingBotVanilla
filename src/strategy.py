@@ -136,7 +136,11 @@ def _apply_entry_filters(
         return True
 
     # ── Trend direction filter (EMA-based) ─────────────────────────────
+    # Добавлен буфер: если close находится в пределах 0.15% от EMA,
+    # считаем рынок "нейтральным" и НЕ блокируем сигнал.
+    # Это предотвращает блокировку всех сигналов в рейнджевом рынке.
     trend_period = filters.get("trend_ema_period")
+    trend_buffer_pct = float(filters.get("trend_ema_buffer_pct", 0.0015))  # default 0.15%
     if trend_period is not None:
         trend_period = int(trend_period)
         if len(candles) >= trend_period + 1:
@@ -145,16 +149,28 @@ def _apply_entry_filters(
             if ema is not None and pd.notna(ema.iloc[-1]):
                 current_close = float(candles[-1]["close"])
                 ema_now = float(ema.iloc[-1])
-                if signal == "BUY_YES" and current_close < ema_now:
+                # Расстояние до EMA в процентах
+                distance_pct = abs(current_close - ema_now) / ema_now if ema_now > 0 else 0
+                # В "нейтральной зоне" — не блокируем
+                if distance_pct <= trend_buffer_pct:
+                    logging.info(
+                        "entry_filter PASS: %s in neutral zone "
+                        "(close %.2f, EMA%d %.2f, dist=%.4f%% <= buffer %.4f%%)",
+                        signal, current_close, trend_period, ema_now,
+                        distance_pct * 100, trend_buffer_pct * 100,
+                    )
+                elif signal == "BUY_YES" and current_close < ema_now:
                     logging.info(
                         "entry_filter BLOCKED: BUY_YES against downtrend "
-                        "(close %.2f < EMA%d %.2f)", current_close, trend_period, ema_now,
+                        "(close %.2f < EMA%d %.2f, dist=%.4f%%)",
+                        current_close, trend_period, ema_now, distance_pct * 100,
                     )
                     return False
-                if signal == "BUY_NO" and current_close > ema_now:
+                elif signal == "BUY_NO" and current_close > ema_now:
                     logging.info(
                         "entry_filter BLOCKED: BUY_NO against uptrend "
-                        "(close %.2f > EMA%d %.2f)", current_close, trend_period, ema_now,
+                        "(close %.2f > EMA%d %.2f, dist=%.4f%%)",
+                        current_close, trend_period, ema_now, distance_pct * 100,
                     )
                     return False
 
@@ -232,27 +248,39 @@ def generate_signal(
                     _ps = _r[_sc].iloc[-2]
                     if pd.notna(_m) and pd.notna(_s):
                         _gap = abs(float(_m) - float(_s))
-                        logging.debug(
-                            "No MACD crossover: prev=%.3f/%.3f curr=%.3f/%.3f gap=%.4f",
-                            float(_pm), float(_ps), float(_m), float(_s), _gap,
-                        )
+                        # Логируем раз в ~5 минут (когда gap < 1 — близко к пересечению)
+                        if _gap < 1.0:
+                            logging.info(
+                                "MACD near crossover: prev=%.3f/%.3f curr=%.3f/%.3f gap=%.4f",
+                                float(_pm), float(_ps), float(_m), float(_s), _gap,
+                            )
             return None
             
         # 2. Проверяем, что текущая (открытая) свеча не сломала этот сигнал
+        #    Используем буфер: разворот засчитываем только если линия ушла
+        #    ЗНАЧИТЕЛЬНО за сигнальную (> 30% от разницы на закрытых свечах).
+        #    Иначе ложные отмены от шума открытой свечи.
         fast, slow, smooth = _get_macd_params(cfg)
         macd_result = ta.macd(df["close"], fast=fast, slow=slow, signal=smooth)
         macd_col = f"MACD_{fast}_{slow}_{smooth}"
         sig_col = f"MACDs_{fast}_{slow}_{smooth}"
-        
-        curr_macd = macd_result[macd_col].iloc[-1]
-        curr_sig = macd_result[sig_col].iloc[-1]
-        
-        # Если линия MACD провалилась обратно за сигнальную — отменяем вход
-        if macd_signal == "BUY_YES" and curr_macd <= curr_sig:
-            logging.info("Signal BUY_YES reversed on open candle — skipping")
+
+        curr_macd = float(macd_result[macd_col].iloc[-1])
+        curr_sig = float(macd_result[sig_col].iloc[-1])
+
+        # Разница на закрытых свечах — насколько уверенно было пересечение
+        completed_result = ta.macd(df_completed["close"], fast=fast, slow=slow, signal=smooth)
+        completed_diff = abs(float(completed_result[macd_col].iloc[-1]) - float(completed_result[sig_col].iloc[-1]))
+        # Буфер: отменяем только если реверс > 30% от силы пересечения
+        reversal_threshold = completed_diff * 0.3
+
+        if macd_signal == "BUY_YES" and (curr_sig - curr_macd) > reversal_threshold:
+            logging.info("Signal BUY_YES reversed on open candle (gap=%.6f > thr=%.6f) — skipping",
+                         curr_sig - curr_macd, reversal_threshold)
             return None
-        if macd_signal == "BUY_NO" and curr_macd >= curr_sig:
-            logging.info("Signal BUY_NO reversed on open candle — skipping")
+        if macd_signal == "BUY_NO" and (curr_macd - curr_sig) > reversal_threshold:
+            logging.info("Signal BUY_NO reversed on open candle (gap=%.6f > thr=%.6f) — skipping",
+                         curr_macd - curr_sig, reversal_threshold)
             return None
     else:
         # Стандартная проверка (если фид не использует WS или свеча только что закрылась)
@@ -262,26 +290,32 @@ def generate_signal(
     # ==========================================
 
     rsi_ok  = _compute_rsi_confirmation(df, cfg, macd_signal)
-    book_available = book_data is not None  # BUG FIX: track whether book fetch succeeded
-    
+    book_available = book_data is not None
+
     if not book_available:
-        logging.warning("Order book unavailable — falling back to RSI-only confirmation")  # BUG FIX: warn on silent degradation
-        
+        logging.warning("Order book unavailable — falling back to RSI-only confirmation")
+
     book_ok = _compute_book_confirmation(book_data, cfg, macd_signal)
 
     # MACD + at least one confirmation (RSI or book imbalance).
-    # Requiring both kills too many valid signals in thin or one-sided books.
     if book_available:
         if not (rsi_ok or book_ok):
+            logging.info(
+                "SIGNAL BLOCKED by confirmations: %s rsi_ok=%s book_ok=%s",
+                macd_signal, rsi_ok, book_ok,
+            )
             return None
     else:
         if not rsi_ok:
+            logging.info("SIGNAL BLOCKED by RSI: %s rsi_ok=%s", macd_signal, rsi_ok)
             return None
 
     # Entry filters — optional last-layer gate
     if not _apply_entry_filters(cfg, macd_signal, book_data, candles):
+        logging.info("SIGNAL BLOCKED by entry_filters: %s", macd_signal)
         return None
 
+    logging.info("✓ SIGNAL PASSED all layers: %s (rsi=%s book=%s)", macd_signal, rsi_ok, book_ok)
     return macd_signal
 
 
