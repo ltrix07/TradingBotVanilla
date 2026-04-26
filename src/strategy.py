@@ -14,6 +14,9 @@ import logging
 import pandas as pd
 import pandas_ta as ta
 
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+
 
 # ── Primary signal: MACD crossover ────────────────────────────────────────────
 
@@ -153,21 +156,21 @@ def _apply_entry_filters(
                 distance_pct = abs(current_close - ema_now) / ema_now if ema_now > 0 else 0
                 # В "нейтральной зоне" — не блокируем
                 if distance_pct <= trend_buffer_pct:
-                    logging.info(
+                    log.info(
                         "entry_filter PASS: %s in neutral zone "
                         "(close %.2f, EMA%d %.2f, dist=%.4f%% <= buffer %.4f%%)",
                         signal, current_close, trend_period, ema_now,
                         distance_pct * 100, trend_buffer_pct * 100,
                     )
                 elif signal == "BUY_YES" and current_close < ema_now:
-                    logging.info(
+                    log.info(
                         "entry_filter BLOCKED: BUY_YES against downtrend "
                         "(close %.2f < EMA%d %.2f, dist=%.4f%%)",
                         current_close, trend_period, ema_now, distance_pct * 100,
                     )
                     return False
                 elif signal == "BUY_NO" and current_close > ema_now:
-                    logging.info(
+                    log.info(
                         "entry_filter BLOCKED: BUY_NO against uptrend "
                         "(close %.2f > EMA%d %.2f, dist=%.4f%%)",
                         current_close, trend_period, ema_now, distance_pct * 100,
@@ -185,7 +188,7 @@ def _apply_entry_filters(
             last_volume = volumes[-1]
             avg_volume = sum(volumes[:-1]) / period
             if avg_volume > 0 and last_volume <= multiplier * avg_volume:
-                logging.info(
+                log.info(
                     "entry_filter BLOCKED: volume %.2f <= %.1f * avg %.2f (no spike)",
                     last_volume, multiplier, avg_volume,
                 )
@@ -250,7 +253,7 @@ def generate_signal(
                         _gap = float(_m) - float(_s)
                         _prev_gap = float(_pm) - float(_ps)
                         # Логируем ВСЕГДА — видеть состояние критически важно
-                        logging.info(
+                        log.info(
                             "MACD no-cross: completed[-2]=%.4f/%.4f(gap=%.4f) "
                             "completed[-1]=%.4f/%.4f(gap=%.4f) same_side=%s",
                             float(_pm), float(_ps), _prev_gap,
@@ -259,7 +262,7 @@ def generate_signal(
                         )
             return None
             
-        logging.info("MACD CROSSOVER FOUND on completed candles: %s", macd_signal)
+        log.info("MACD CROSSOVER FOUND on completed candles: %s", macd_signal)
 
         # 2. Проверяем, что текущая (открытая) свеча не сломала этот сигнал
         #    Используем буфер: разворот засчитываем только если линия ушла
@@ -280,11 +283,11 @@ def generate_signal(
         reversal_threshold = completed_diff * 0.3
 
         if macd_signal == "BUY_YES" and (curr_sig - curr_macd) > reversal_threshold:
-            logging.info("Signal BUY_YES reversed on open candle (gap=%.6f > thr=%.6f) — skipping",
+            log.info("Signal BUY_YES reversed on open candle (gap=%.6f > thr=%.6f) — skipping",
                          curr_sig - curr_macd, reversal_threshold)
             return None
         if macd_signal == "BUY_NO" and (curr_macd - curr_sig) > reversal_threshold:
-            logging.info("Signal BUY_NO reversed on open candle (gap=%.6f > thr=%.6f) — skipping",
+            log.info("Signal BUY_NO reversed on open candle (gap=%.6f > thr=%.6f) — skipping",
                          curr_macd - curr_sig, reversal_threshold)
             return None
     else:
@@ -298,29 +301,29 @@ def generate_signal(
     book_available = book_data is not None
 
     if not book_available:
-        logging.warning("Order book unavailable — falling back to RSI-only confirmation")
+        log.warning("Order book unavailable — falling back to RSI-only confirmation")
 
     book_ok = _compute_book_confirmation(book_data, cfg, macd_signal)
 
     # MACD + at least one confirmation (RSI or book imbalance).
     if book_available:
         if not (rsi_ok or book_ok):
-            logging.info(
+            log.info(
                 "SIGNAL BLOCKED by confirmations: %s rsi_ok=%s book_ok=%s",
                 macd_signal, rsi_ok, book_ok,
             )
             return None
     else:
         if not rsi_ok:
-            logging.info("SIGNAL BLOCKED by RSI: %s rsi_ok=%s", macd_signal, rsi_ok)
+            log.info("SIGNAL BLOCKED by RSI: %s rsi_ok=%s", macd_signal, rsi_ok)
             return None
 
     # Entry filters — optional last-layer gate
     if not _apply_entry_filters(cfg, macd_signal, book_data, candles):
-        logging.info("SIGNAL BLOCKED by entry_filters: %s", macd_signal)
+        log.info("SIGNAL BLOCKED by entry_filters: %s", macd_signal)
         return None
 
-    logging.info("✓ SIGNAL PASSED all layers: %s (rsi=%s book=%s)", macd_signal, rsi_ok, book_ok)
+    log.info("✓ SIGNAL PASSED all layers: %s (rsi=%s book=%s)", macd_signal, rsi_ok, book_ok)
     return macd_signal
 
 
