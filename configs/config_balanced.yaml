@@ -43,6 +43,7 @@ strategy:
     depth_levels: 5
   entry_filters:
     trend_ema_period: 50      # ~50min trend — loosened for more signals
+    trend_ema_buffer_pct: 0.0035   # 0.35% — neutral zone for 1m timeframe
 
 risk_management:
   initial_balance_usd: 1000.0

@@ -45,6 +45,7 @@ strategy:
   entry_filters:
     # 90 one-minute candles = 1.5h trend — balanced for medium regime
     trend_ema_period: 65
+    trend_ema_buffer_pct: 0.0035
     require_volume_spike: true
     volume_spike_multiplier: 1.3    # catch real moves without over-filtering
     volume_spike_period: 10         # 10-candle stable baseline

@@ -52,6 +52,7 @@ strategy:
     # 60 one-minute candles = 1h trend, longer than a typical trade cycle.
     # Too short EMA (40 as before) stops filtering counter-trend signals.
     trend_ema_period: 45
+    trend_ema_buffer_pct: 0.0035
 
 # ── Risk management ──────────────────────────────────────────
 risk_management:
