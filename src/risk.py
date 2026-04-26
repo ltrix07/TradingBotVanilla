@@ -64,14 +64,15 @@ def normalize_atr(
     Example: ATR=800 at BTC=80,000 → 0.01 (1% per bar move)
 
     This fraction is passed directly to compute_dynamic_sl_tp().
-    Clamped to [0.001, 0.20] (0.1%–20% of price) to prevent extreme values.
+    Clamped to [0.0001, 0.20] (0.01%–20% of price) to prevent extreme values.
+    Note: for 1m candles, typical ATR is 0.05–0.15% of price.
     """
     fallback_price = (cfg or {}).get("risk_management", {}).get(
         "btc_price_fallback", 90_000.0
     )
     btc_price  = last_close if (last_close and last_close > 0) else fallback_price
     normalized = atr_raw / btc_price
-    return max(0.001, min(normalized, 0.20))
+    return max(0.0001, min(normalized, 0.20))
 
 
 def atr_below_minimum(atr_normalized: float | None, cfg: dict) -> bool:
