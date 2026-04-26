@@ -230,12 +230,12 @@ def generate_signal(
 
     # === ИСПРАВЛЕННЫЙ БЛОК ЛОГИКИ СИГНАЛОВ ===
     if is_last_candle_open and len(candles) >= 21:
-        # 1. Ищем полноценное пересечение только на закрытых свечах (защита от дергания)
+        # 1. Ищем полноценное пересечение тольк�� на закрытых свечах (защита от дергания)
         df_completed = df.iloc[:-1].copy()
         macd_signal = _compute_macd_signal(df_completed, cfg)
 
         if macd_signal is None:
-            # Log MACD proximity to crossover for diagnostics
+            # Безусловный лог состояния MACD на закрытых свечах
             fast, slow, smooth = _get_macd_params(cfg)
             _r = ta.macd(df_completed["close"], fast=fast, slow=slow, signal=smooth)
             if _r is not None:
@@ -247,15 +247,20 @@ def generate_signal(
                     _pm = _r[_mc].iloc[-2]
                     _ps = _r[_sc].iloc[-2]
                     if pd.notna(_m) and pd.notna(_s):
-                        _gap = abs(float(_m) - float(_s))
-                        # Логируем раз в ~5 минут (когда gap < 1 — близко к пересечению)
-                        if _gap < 1.0:
-                            logging.info(
-                                "MACD near crossover: prev=%.3f/%.3f curr=%.3f/%.3f gap=%.4f",
-                                float(_pm), float(_ps), float(_m), float(_s), _gap,
-                            )
+                        _gap = float(_m) - float(_s)
+                        _prev_gap = float(_pm) - float(_ps)
+                        # Логируем ВСЕГДА — видеть состояние критически важно
+                        logging.info(
+                            "MACD no-cross: completed[-2]=%.4f/%.4f(gap=%.4f) "
+                            "completed[-1]=%.4f/%.4f(gap=%.4f) same_side=%s",
+                            float(_pm), float(_ps), _prev_gap,
+                            float(_m), float(_s), _gap,
+                            "yes" if (_prev_gap > 0) == (_gap > 0) else "NO(missed?)",
+                        )
             return None
             
+        logging.info("MACD CROSSOVER FOUND on completed candles: %s", macd_signal)
+
         # 2. Проверяем, что текущая (открытая) свеча не сломала этот сигнал
         #    Используем буфер: разворот засчитываем только если линия ушла
         #    ЗНАЧИТЕЛЬНО за сигнальную (> 30% от разницы на закрытых свечах).
