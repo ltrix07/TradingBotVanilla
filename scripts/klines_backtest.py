@@ -934,7 +934,7 @@ def run_all(candles: List[Candle], configs: dict) -> List[StrategyResult]:
         func = STRATEGY_FUNCS[strat_name]
         log.info(f"\n{'='*60}")
         log.info(f"Testing {strat_name} -- {len(cfgs)} configs...")
-        log.info(f"{'='*60}")fo(f"{'='*60}")
+        log.info(f"{'='*60}")
 
         best = None
         log_step = max(1, len(cfgs) // 10)  # ~10 progress updates
