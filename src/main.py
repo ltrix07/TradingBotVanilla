@@ -34,7 +34,7 @@ from fetcher import (
     BinanceFuturesTradesFeed,
     BinanceFuturesBookFeed,
 )
-from strategy import generate_signal, get_macd_state
+from strategy import generate_signal, should_reverse_close, get_funding_state
 from risk import (
     check_sl_tp,
     should_open_trade,
@@ -149,19 +149,25 @@ def _print_close(
 
 def _print_status(
     symbol: str, ask: float, bid: float, balance: float, cycle: int,
-    macd_state: dict | None = None, source: str = "?",
+    funding_state: dict | None = None, source: str = "?",
     can_trade: bool = True, book_imbalance: float | None = None,
     trailing_stop: float | None = None,
     ws_diag: dict | None = None,
 ) -> None:
     spread = ask - bid
 
-    if macd_state and macd_state["diff"] is not None:
-        diff = macd_state["diff"]
-        arrow = f"{_G}▲{_RS}" if diff > 0 else f"{_R}▼{_RS}"
-        macd_s = f"  macd {arrow}{abs(diff):.3f}"
+    # Funding rate display (replaces MACD)
+    if funding_state and funding_state.get("rate_bps") is not None:
+        rbps = funding_state["rate_bps"]
+        bias = funding_state.get("bias", "")
+        if rbps > 10:
+            fr_s = f"  fr {_R}{rbps:+.1f}bps{_RS}({bias})"
+        elif rbps < -10:
+            fr_s = f"  fr {_G}{rbps:+.1f}bps{_RS}({bias})"
+        else:
+            fr_s = f"  fr {_W}{rbps:+.1f}bps{_RS}"
     else:
-        macd_s = f"  macd {_W}--{_RS}"
+        fr_s = f"  fr {_W}--{_RS}"
 
     trade_s = "" if can_trade else f"  {_Y}wait{_RS}"
 
@@ -188,7 +194,7 @@ def _print_status(
         f"  ask {_B}${ask:,.2f}{_RS}  bid {_B}${bid:,.2f}{_RS}"
         f"  spread ${spread:.2f}"
         f"  src {_W}{source}{_RS}"
-        f"{macd_s}{imb_s}{trail_s}{trade_s}{ws_s}"
+        f"{fr_s}{imb_s}{trail_s}{trade_s}{ws_s}"
         f"  bal ${balance:.2f}"
     )
     print(f"\r{line}          ", end="", flush=True)
@@ -232,30 +238,6 @@ def _notify_telegram_drawdown(cfg: dict, balance: float) -> None:
         log.warning("Telegram notification failed: %s", exc)
 
 
-# ── Funding-rate guard ────────────────────────────────────────────────────────
-
-def _funding_blocks_entry(funding_info: dict | None, side: str, cfg: dict) -> bool:
-    """Return True if funding rate blocks opening a new position on `side`.
-
-    LONGs pay shorts when funding > 0 (positive funding).
-    A high positive funding rate means LONGs are penalized → skip LONG entries.
-    A very negative funding rate means SHORTs are penalized → skip SHORT entries.
-
-    Config: risk_management.max_funding_rate_bps (default 50 = 0.5% per 8h).
-    """
-    if funding_info is None:
-        return False  # No data — fail open, do not block
-    max_bps = float(cfg.get("risk_management", {}).get("max_funding_rate_bps", 0))
-    if max_bps <= 0:
-        return False  # Guard disabled
-    bps = float(funding_info.get("funding_rate_bps", 0.0))
-    if side == "LONG" and bps > max_bps:
-        return True
-    if side == "SHORT" and bps < -max_bps:
-        return True
-    return False
-
-
 # ── Max-hold-time guard ───────────────────────────────────────────────────────
 
 def _exceeds_max_hold(position: dict, cfg: dict) -> float | None:
@@ -289,14 +271,23 @@ async def run_loop(cfg: dict) -> None:
     atr_mode   = "ATR-dynamic" if rm_cfg.get("use_atr_dynamic", True) else "fixed"
     trail_mode = f"trailing {'✓' if rm_cfg.get('trailing_stop_enabled', True) else '✗'}"
 
+    strat_name = cfg.get("strategy", {}).get("name", "FundingRate")
+    funding_thr = cfg.get("strategy", {}).get("funding", {}).get("threshold_bps", 25)
+    hold_min = rm_cfg.get("max_hold_time_minutes", 480)
+
     print(f"\n{_B}{_C}{_bar('═')}{_RS}")
     print(f"  {_B}CRYPTO FUTURES PAPER TRADING BOT  [async]{_RS}")
+    print(f"  {_B}Strategy: {strat_name} — Funding Rate Contrarian{_RS}")
     print(f"{_C}{_bar()}{_RS}")
     print(f"  Symbol  {_B}{symbol}{_RS}   Leverage  {_B}{leverage}x{_RS}")
     print(
         f"  SL ATRx{sl_mult}  TP ATRx{tp_mult}  "
         f"Max daily loss {max_loss:.0f}%  "
         f"Risk/trade {risk_pct:.1f}%"
+    )
+    print(
+        f"  Funding threshold  {_B}+/-{funding_thr} bps{_RS}  "
+        f"Max hold  {_B}{hold_min} min{_RS}"
     )
     print(f"  Risk: {_C}{atr_mode}{_RS}  {_C}{trail_mode}{_RS}")
     print(f"{_C}{_bar('═')}{_RS}\n")
@@ -430,15 +421,18 @@ async def _iteration(
     last_close = float(candles[-1]["close"]) if candles else None
     atr_normalized = normalize_atr(atr_raw, last_close, cfg) if atr_raw else None
 
+    # ── 3b. FUNDING RATE (signal source for this strategy) ─────────────────
+    funding_info = await fetch_funding_rate_async(cfg)
+    funding_state = get_funding_state(funding_info)
+
     # ── 4. STATUS LINE ───────────────────────────────────────────────────────
-    macd_state = get_macd_state(candles, cfg)
     can_trade  = should_open_trade(portfolio, cfg=cfg)
     trailing   = pos.get("trailing_stop_price") if pos else None
     ws_diag = trades_feed.get_diagnostics() if trades_feed is not None else None
     _print_status(
         symbol, best_ask, best_bid,
         portfolio["balance_usd"], cycle,
-        macd_state=macd_state,
+        funding_state=funding_state,
         source=f"{candle_source}{len(candles)}+{book_source}",
         can_trade=can_trade,
         book_imbalance=book_imbalance,
@@ -518,22 +512,14 @@ async def _iteration(
                     save_state(state, cfg)
                     return
 
-    # ── 6c. REVERSE-CLOSE CHECK ──────────────────────────────────────────────
+    # ── 6c. REVERSE-CLOSE CHECK (funding rate flipped) ─────────────────────
     if pos is not None and risk_cfg_iter.get("use_reverse_close", False):
-        reverse_signal = generate_signal(
-            candles, cfg, book_data=book,
-            is_last_candle_open=use_live_candles,
-        )
-        # BUY_YES → bullish (LONG direction); BUY_NO → bearish (SHORT direction)
         pos_side = pos.get("side", "")
-        is_reverse = (
-            (pos_side == "LONG"  and reverse_signal == "BUY_NO")
-            or (pos_side == "SHORT" and reverse_signal == "BUY_YES")
-        )
-        if is_reverse:
+        if should_reverse_close(funding_info, pos_side, cfg):
             exit_p = get_exit_price(pos, best_bid, best_ask)
             state  = close_position(state, exit_p, "REVERSE_CLOSE", cfg, book_data=book)
             trade  = state["trade_history"][-1]
+            rate_bps = funding_info["funding_rate_bps"] if funding_info else 0
             _print_status_newline()
             _print_close(
                 "REVERSE_CLOSE",
@@ -541,7 +527,7 @@ async def _iteration(
                 trade["exit_price"],
                 trade["pnl"],
                 state["virtual_portfolio"]["balance_usd"],
-                label_suffix=f"(signal → {reverse_signal})",
+                label_suffix=f"(funding flipped {rate_bps:+.1f}bps)",
             )
             save_state(state, cfg)
             return
@@ -693,12 +679,12 @@ async def _iteration(
             pos.pop("sl_breach_since", None)
             state["virtual_portfolio"]["active_position"] = pos
 
-    # ── 8. ENTRY LOGIC ───────────────────────────────────────────────────────
+    # ── 8. ENTRY LOGIC (Funding Rate Contrarian) ───────────────────────────
     if not should_open_trade(portfolio, cfg=cfg):
         save_state(state, cfg)
         return
 
-    # Фикс A: skip trading when ATR is below noise threshold
+    # ATR minimum gate — skip in dead-flat markets where SL/TP make no sense
     if atr_below_minimum(atr_normalized, cfg):
         if cycle % 30 == 0:
             _print_status_newline()
@@ -710,17 +696,16 @@ async def _iteration(
         save_state(state, cfg)
         return
 
-    signal = generate_signal(
-        candles, cfg, book_data=book,
-        is_last_candle_open=use_live_candles,
-    )
+    # Signal from funding rate (fetched in step 3b above)
+    has_position = portfolio.get("active_position") is not None
+    signal = generate_signal(funding_info, cfg, position_active=has_position)
 
     if cycle % 30 == 0:
         _print_status_newline()
+        rate_bps = funding_info["funding_rate_bps"] if funding_info else 0
         log.info(
-            "DIAG cycle %d: signal=%s atr=%.6f macd=%.3f candles=%d live=%s",
-            cycle, signal, atr_normalized or 0,
-            macd_state.get("diff", 0) or 0, len(candles), use_live_candles,
+            "DIAG cycle %d: signal=%s atr=%.6f funding=%+.2f bps candles=%d",
+            cycle, signal, atr_normalized or 0, rate_bps, len(candles),
         )
 
     if signal is None:
@@ -749,16 +734,9 @@ async def _iteration(
             save_state(state, cfg)
             return
 
-    # Funding-rate guard — avoid opening positions into a punishing funding cycle
-    funding_info = await fetch_funding_rate_async(cfg)
-    if _funding_blocks_entry(funding_info, side, cfg):
-        _print_status_newline()
-        log.info(
-            "Funding guard: %s blocked (rate %.2f bps exceeds limit)",
-            side, funding_info["funding_rate_bps"],
-        )
-        save_state(state, cfg)
-        return
+    # NOTE: No separate funding guard — the funding rate IS our signal.
+    # The strategy is contrarian: we always enter on the RECEIVING side of funding,
+    # so funding payments are an additional profit source, not a cost.
 
     # Risk-based position sizing (uses sl_pct so loss == balance * risk_per_trade_pct)
     size_usd = calculate_position_size(
