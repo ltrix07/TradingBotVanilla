@@ -1,45 +1,29 @@
 """
 orderflow_backtest.py — Backtest order flow (aggTrades delta) strategy.
 
-Downloads historical aggTrades from data.binance.vision, computes rolling
-buy/sell delta, simulates entries/exits, and prints performance metrics.
+Downloads historical aggTrades from data.binance.vision, pre-aggregates
+into 1-second buckets, then runs fast backtests.
 
 Usage:
-    # 1. Download data first (run separately — large files):
-    python scripts/orderflow_backtest.py --download --days 7
+    python scripts/orderflow_backtest.py --download --days 7   # download only
+    python scripts/orderflow_backtest.py --days 7              # run backtest
+    python scripts/orderflow_backtest.py --symbol ETHUSDT      # different pair
 
-    # 2. Run backtest on downloaded data:
-    python scripts/orderflow_backtest.py
-
-    # 3. Specific symbol:
-    python scripts/orderflow_backtest.py --symbol ETHUSDT --days 5
-
-Data source:
-    https://data.binance.vision/data/futures/um/daily/aggTrades/{SYMBOL}/
-    CSV: agg_trade_id, price, quantity, first_trade_id, last_trade_id,
-         transact_time, is_buyer_maker
-
-Strategy:
-    - Compute rolling buy/sell delta over a time window (e.g. 30s)
-    - Delta intensity = net_delta / total_volume (normalized to [-1, +1])
-    - When intensity > +threshold for persistence_sec → LONG
-    - When intensity < -threshold for persistence_sec → SHORT
-    - SL/TP as percentage of entry price
-    - Cooldown between trades to avoid overtrading
+Performance: ~10M trades are aggregated into ~600K buckets (1 per second),
+making each backtest config run in seconds, not hours.
 """
 
 import argparse
 import csv
-import gzip
 import io
 import os
 import sys
 import time
 import urllib.request
 import zipfile
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -50,198 +34,57 @@ BASE_URL = "https://data.binance.vision/data/futures/um/daily/aggTrades"
 LEVERAGE = 5
 POSITION_PCT = 0.30
 INITIAL_BALANCE = 1000.0
-FEE_PCT = 0.0005           # 0.05% per side → 0.10% round-trip
+FEE_PCT = 0.0005           # 0.05% per side
 SLIPPAGE_PCT = 0.0002      # 0.02% per side
 
 
-# ── Data download ─────────────────────────────────────────────────────────────
-
-def download_aggtrades(symbol: str, days: int = 7) -> list[str]:
-    """Download aggTrades CSVs from data.binance.vision. Returns list of file paths."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    end_date = datetime.now(timezone.utc).date() - timedelta(days=1)  # yesterday
-    paths = []
-
-    for i in range(days):
-        date = end_date - timedelta(days=days - 1 - i)
-        date_str = date.strftime("%Y-%m-%d")
-        csv_path = os.path.join(DATA_DIR, f"{symbol}-aggTrades-{date_str}.csv")
-
-        if os.path.exists(csv_path):
-            size_mb = os.path.getsize(csv_path) / (1024 * 1024)
-            print(f"  {date_str}: already exists ({size_mb:.1f} MB)")
-            paths.append(csv_path)
-            continue
-
-        url = f"{BASE_URL}/{symbol}/{symbol}-aggTrades-{date_str}.zip"
-        print(f"  {date_str}: downloading from {url} ...", end="", flush=True)
-
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            resp = urllib.request.urlopen(req, timeout=120)
-            zip_data = resp.read()
-
-            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-                # ZIP contains one CSV file
-                csv_name = zf.namelist()[0]
-                with zf.open(csv_name) as f_in:
-                    with open(csv_path, "wb") as f_out:
-                        f_out.write(f_in.read())
-
-            size_mb = os.path.getsize(csv_path) / (1024 * 1024)
-            print(f" OK ({size_mb:.1f} MB)")
-            paths.append(csv_path)
-            time.sleep(0.5)
-
-        except Exception as e:
-            print(f" FAILED: {e}")
-            # Try .zip with uppercase
-            continue
-
-    return paths
-
-
-# ── Data loading ──────────────────────────────────────────────────────────────
+# ── Data structures ──────────────────────────────────────────────────────────
 
 @dataclass
-class AggTrade:
-    """Single aggregated trade from Binance."""
-    timestamp_ms: int
-    price: float
-    qty: float
-    is_buyer_maker: bool  # True = aggressive SELL, False = aggressive BUY
-
-    @property
-    def is_buy(self) -> bool:
-        """True if the aggressor was a buyer (taker buy)."""
-        return not self.is_buyer_maker
-
-    @property
-    def usd_volume(self) -> float:
-        return self.price * self.qty
-
-
-def load_trades(csv_path: str) -> list[AggTrade]:
-    """Load aggTrades from CSV. Returns sorted list."""
-    trades = []
-    with open(csv_path, "r") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            try:
-                # Columns: agg_trade_id, price, quantity, first_trade_id,
-                #          last_trade_id, transact_time, is_buyer_maker
-                trades.append(AggTrade(
-                    timestamp_ms=int(row[5]),
-                    price=float(row[1]),
-                    qty=float(row[2]),
-                    is_buyer_maker=(row[6].strip().lower() == "true"),
-                ))
-            except (ValueError, IndexError):
-                continue  # skip header or malformed rows
-    return trades
-
-
-# ── Rolling delta engine ─────────────────────────────────────────────────────
-
-class DeltaEngine:
-    """Computes rolling buy/sell delta over a time window.
-
-    Delta = sum(buy_volume) - sum(sell_volume) over the last `window_ms`.
-    Intensity = delta / total_volume, normalized to [-1, +1].
-
-    A persistent strong intensity indicates real order flow pressure,
-    not just a single large order (which could be a stop hunt).
-    """
-
-    def __init__(self, window_ms: int = 30_000):
-        self.window_ms = window_ms
-        self._buys: deque[tuple[int, float]] = deque()   # (ts_ms, usd_vol)
-        self._sells: deque[tuple[int, float]] = deque()  # (ts_ms, usd_vol)
-        self._buy_sum: float = 0.0
-        self._sell_sum: float = 0.0
-
-    def update(self, trade: AggTrade) -> None:
-        """Add a new trade and evict expired ones."""
-        ts = trade.timestamp_ms
-        usd = trade.usd_volume
-        cutoff = ts - self.window_ms
-
-        if trade.is_buy:
-            self._buys.append((ts, usd))
-            self._buy_sum += usd
-        else:
-            self._sells.append((ts, usd))
-            self._sell_sum += usd
-
-        # Evict old buys
-        while self._buys and self._buys[0][0] < cutoff:
-            _, old_usd = self._buys.popleft()
-            self._buy_sum -= old_usd
-
-        # Evict old sells
-        while self._sells and self._sells[0][0] < cutoff:
-            _, old_usd = self._sells.popleft()
-            self._sell_sum -= old_usd
-
-    @property
-    def delta(self) -> float:
-        """Net delta in USD: positive = more aggressive buying."""
-        return self._buy_sum - self._sell_sum
+class SecondBucket:
+    """One-second aggregation of all trades."""
+    timestamp_sec: int      # unix seconds
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    buy_volume_usd: float   # aggressive buy volume
+    sell_volume_usd: float  # aggressive sell volume
+    trade_count: int
 
     @property
     def total_volume(self) -> float:
-        return self._buy_sum + self._sell_sum
+        return self.buy_volume_usd + self.sell_volume_usd
 
     @property
-    def intensity(self) -> float:
-        """Delta / total_volume, in [-1, +1]. 0 = balanced."""
-        total = self.total_volume
-        if total < 1.0:
-            return 0.0
-        return self.delta / total
+    def delta(self) -> float:
+        return self.buy_volume_usd - self.sell_volume_usd
 
-    @property
-    def buy_volume(self) -> float:
-        return self._buy_sum
-
-    @property
-    def sell_volume(self) -> float:
-        return self._sell_sum
-
-    def reset(self) -> None:
-        self._buys.clear()
-        self._sells.clear()
-        self._buy_sum = 0.0
-        self._sell_sum = 0.0
-
-
-# ── Backtest engine ───────────────────────────────────────────────────────────
 
 @dataclass
 class Trade:
-    entry_time_ms: int
-    exit_time_ms: int
-    side: str           # "LONG" or "SHORT"
+    entry_time_sec: int
+    exit_time_sec: int
+    side: str
     entry_price: float
     exit_price: float
     delta_intensity: float
     pnl_usd: float
     pnl_pct: float
-    result: str         # "TP", "SL", "TIMEOUT"
-    hold_seconds: float
+    result: str
+    hold_seconds: int
 
 
 @dataclass
 class BacktestConfig:
-    window_sec: int         # rolling delta window (seconds)
-    intensity_threshold: float  # min |intensity| to trigger signal
-    persistence_sec: float  # how long intensity must stay above threshold
-    sl_pct: float           # stop loss percentage
-    tp_pct: float           # take profit percentage
-    cooldown_sec: float     # minimum seconds between trades
-    max_hold_sec: float     # max hold time before timeout exit
-    min_volume_usd: float   # min total volume in window to consider signal valid
+    window_sec: int
+    intensity_threshold: float
+    persistence_sec: int
+    sl_pct: float
+    tp_pct: float
+    cooldown_sec: int
+    max_hold_sec: int
+    min_volume_usd: float
 
 
 @dataclass
@@ -274,14 +117,12 @@ class BacktestResult:
 
     @property
     def avg_loss(self) -> float:
-        l = [t.pnl_usd for t in self.trades if t.pnl_usd <= 0]
-        return sum(l) / len(l) if l else 0
+        lo = [t.pnl_usd for t in self.trades if t.pnl_usd <= 0]
+        return sum(lo) / len(lo) if lo else 0
 
     @property
     def avg_hold_sec(self) -> float:
-        if not self.trades:
-            return 0
-        return sum(t.hold_seconds for t in self.trades) / len(self.trades)
+        return sum(t.hold_seconds for t in self.trades) / len(self.trades) if self.trades else 0
 
     @property
     def profit_factor(self) -> float:
@@ -290,62 +131,201 @@ class BacktestResult:
         return gross_win / gross_loss if gross_loss > 0 else 0
 
 
-def run_backtest(all_trades: list[AggTrade], cfg: BacktestConfig) -> BacktestResult:
-    """Run a single backtest configuration on pre-loaded aggTrades."""
+# ── Data download ─────────────────────────────────────────────────────────────
+
+def download_aggtrades(symbol: str, days: int = 7) -> list[str]:
+    """Download aggTrades ZIPs from data.binance.vision."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+    paths = []
+
+    for i in range(days):
+        date = end_date - timedelta(days=days - 1 - i)
+        date_str = date.strftime("%Y-%m-%d")
+        csv_path = os.path.join(DATA_DIR, f"{symbol}-aggTrades-{date_str}.csv")
+
+        if os.path.exists(csv_path):
+            size_mb = os.path.getsize(csv_path) / (1024 * 1024)
+            print(f"  {date_str}: exists ({size_mb:.1f} MB)")
+            paths.append(csv_path)
+            continue
+
+        url = f"{BASE_URL}/{symbol}/{symbol}-aggTrades-{date_str}.zip"
+        print(f"  {date_str}: downloading...", end="", flush=True)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urllib.request.urlopen(req, timeout=120)
+            zip_data = resp.read()
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                csv_name = zf.namelist()[0]
+                with zf.open(csv_name) as f_in, open(csv_path, "wb") as f_out:
+                    f_out.write(f_in.read())
+            size_mb = os.path.getsize(csv_path) / (1024 * 1024)
+            print(f" OK ({size_mb:.1f} MB)")
+            paths.append(csv_path)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f" FAILED: {e}")
+
+    return paths
+
+
+# ── Pre-aggregation: trades → 1-second buckets ───────────────────────────────
+
+def aggregate_to_buckets(csv_paths: list[str]) -> list[SecondBucket]:
+    """Read raw CSVs and aggregate into 1-second OHLCV+delta buckets.
+
+    This is the key optimization: ~10M raw trades become ~600K buckets.
+    All subsequent backtests operate on buckets, not individual trades.
+    """
+    # Pass 1: build dict of second → accumulated data
+    buckets_dict: dict[int, list] = {}
+    # list = [open_price, high, low, close, buy_vol, sell_vol, count, first_price_set]
+
+    total_raw = 0
+    for path in csv_paths:
+        file_trades = 0
+        with open(path, "r") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                try:
+                    ts_ms = int(row[5])
+                    price = float(row[1])
+                    qty = float(row[2])
+                    is_buyer_maker = (row[6].strip().lower() == "true")
+                except (ValueError, IndexError):
+                    continue
+
+                ts_sec = ts_ms // 1000
+                usd = price * qty
+
+                if ts_sec not in buckets_dict:
+                    # [open, high, low, close, buy_vol, sell_vol, count]
+                    buckets_dict[ts_sec] = [price, price, price, price, 0.0, 0.0, 0]
+
+                b = buckets_dict[ts_sec]
+                if price > b[1]:
+                    b[1] = price  # high
+                if price < b[2]:
+                    b[2] = price  # low
+                b[3] = price      # close (last price)
+
+                if not is_buyer_maker:  # aggressive BUY
+                    b[4] += usd
+                else:                   # aggressive SELL
+                    b[5] += usd
+                b[6] += 1
+                file_trades += 1
+
+        total_raw += file_trades
+        print(f"  {os.path.basename(path)}: {file_trades:,} trades")
+
+    # Pass 2: convert to sorted list of SecondBucket
+    buckets = []
+    for ts_sec in sorted(buckets_dict.keys()):
+        b = buckets_dict[ts_sec]
+        buckets.append(SecondBucket(
+            timestamp_sec=ts_sec,
+            open_price=b[0],
+            high_price=b[1],
+            low_price=b[2],
+            close_price=b[3],
+            buy_volume_usd=b[4],
+            sell_volume_usd=b[5],
+            trade_count=b[6],
+        ))
+
+    print(f"  Aggregated: {total_raw:,} trades → {len(buckets):,} second-buckets "
+          f"({total_raw / max(len(buckets), 1):.1f} trades/sec avg)")
+
+    return buckets
+
+
+# ── Backtest engine (operates on buckets) ─────────────────────────────────────
+
+def run_backtest(buckets: list[SecondBucket], cfg: BacktestConfig) -> BacktestResult:
+    """Run backtest on pre-aggregated second buckets. Fast."""
     result = BacktestResult(config=cfg)
     balance = INITIAL_BALANCE
     peak_balance = balance
     max_dd = 0.0
+    n = len(buckets)
 
-    engine = DeltaEngine(window_ms=cfg.window_sec * 1000)
+    # Pre-compute prefix sums for rolling window
+    # This avoids re-summing the window for every bucket
+    buy_prefix = [0.0] * (n + 1)
+    sell_prefix = [0.0] * (n + 1)
+    for i, b in enumerate(buckets):
+        buy_prefix[i + 1] = buy_prefix[i] + b.buy_volume_usd
+        sell_prefix[i + 1] = sell_prefix[i] + b.sell_volume_usd
 
-    # State machine
+    # Map timestamp → index for binary search
+    timestamps = [b.timestamp_sec for b in buckets]
+
+    def find_window_start(current_idx: int) -> int:
+        """Find the first bucket index within the rolling window."""
+        target_ts = buckets[current_idx].timestamp_sec - cfg.window_sec
+        lo, hi = 0, current_idx
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if timestamps[mid] < target_ts:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    # State
     in_position = False
     position_side = ""
     entry_price = 0.0
-    entry_time_ms = 0
+    entry_idx = 0
     entry_intensity = 0.0
-    last_exit_time_ms = 0
-    signal_start_ms = 0        # when intensity first crossed threshold
-    current_signal_side = ""   # "LONG" or "SHORT" or ""
-
+    last_exit_idx = -1
+    signal_start_idx = -1
+    signal_side = ""
     notional = 0.0
     qty = 0.0
 
-    for trade in all_trades:
-        engine.update(trade)
+    cooldown_end_ts = 0
 
-        ts = trade.timestamp_ms
-        price = trade.price
-        intensity = engine.intensity
-        total_vol = engine.total_volume
+    for i in range(cfg.window_sec, n):  # skip first window_sec to have full window
+        b = buckets[i]
+        ts = b.timestamp_sec
+        price = b.close_price
 
-        # ── Position management: check SL/TP/timeout ─────────────────────
+        # ── Position management ──────────────────────────────────────
         if in_position:
-            hold_sec = (ts - entry_time_ms) / 1000
+            hold_sec = ts - buckets[entry_idx].timestamp_sec
 
-            # Calculate current PnL
-            if position_side == "LONG":
-                current_pnl_pct = (price - entry_price) / entry_price
-            else:
-                current_pnl_pct = (entry_price - price) / entry_price
-
+            # Check SL/TP using high/low of this second
             exit_reason = None
+            exit_price = 0.0
 
-            if current_pnl_pct >= cfg.tp_pct:
-                exit_reason = "TP"
-                exit_price = entry_price * (1 + cfg.tp_pct) if position_side == "LONG" \
-                    else entry_price * (1 - cfg.tp_pct)
-            elif current_pnl_pct <= -cfg.sl_pct:
-                exit_reason = "SL"
-                exit_price = entry_price * (1 - cfg.sl_pct) if position_side == "LONG" \
-                    else entry_price * (1 + cfg.sl_pct)
-            elif hold_sec >= cfg.max_hold_sec:
+            if position_side == "LONG":
+                # SL check (low)
+                sl_price = entry_price * (1 - cfg.sl_pct)
+                tp_price = entry_price * (1 + cfg.tp_pct)
+                if b.low_price <= sl_price:
+                    exit_reason = "SL"
+                    exit_price = sl_price
+                elif b.high_price >= tp_price:
+                    exit_reason = "TP"
+                    exit_price = tp_price
+            else:  # SHORT
+                sl_price = entry_price * (1 + cfg.sl_pct)
+                tp_price = entry_price * (1 - cfg.tp_pct)
+                if b.high_price >= sl_price:
+                    exit_reason = "SL"
+                    exit_price = sl_price
+                elif b.low_price <= tp_price:
+                    exit_reason = "TP"
+                    exit_price = tp_price
+
+            if not exit_reason and hold_sec >= cfg.max_hold_sec:
                 exit_reason = "TIMEOUT"
                 exit_price = price
 
             if exit_reason:
-                # Calculate PnL
                 if position_side == "LONG":
                     pnl_gross = (exit_price - entry_price) * qty
                 else:
@@ -354,17 +334,16 @@ def run_backtest(all_trades: list[AggTrade], cfg: BacktestConfig) -> BacktestRes
                 fee = FEE_PCT * notional + FEE_PCT * abs(exit_price * qty)
                 slip = SLIPPAGE_PCT * notional
                 pnl_net = pnl_gross - fee - slip
-                pnl_pct = pnl_net / balance * 100
 
                 result.trades.append(Trade(
-                    entry_time_ms=entry_time_ms,
-                    exit_time_ms=ts,
+                    entry_time_sec=buckets[entry_idx].timestamp_sec,
+                    exit_time_sec=ts,
                     side=position_side,
                     entry_price=entry_price,
                     exit_price=exit_price,
                     delta_intensity=entry_intensity,
                     pnl_usd=pnl_net,
-                    pnl_pct=pnl_pct,
+                    pnl_pct=pnl_net / balance * 100 if balance > 0 else 0,
                     result=exit_reason,
                     hold_seconds=hold_sec,
                 ))
@@ -372,83 +351,55 @@ def run_backtest(all_trades: list[AggTrade], cfg: BacktestConfig) -> BacktestRes
                 balance += pnl_net
                 if balance > peak_balance:
                     peak_balance = balance
-                dd = (peak_balance - balance) / peak_balance * 100
+                dd = (peak_balance - balance) / peak_balance * 100 if peak_balance > 0 else 0
                 if dd > max_dd:
                     max_dd = dd
 
                 in_position = False
-                last_exit_time_ms = ts
+                cooldown_end_ts = ts + cfg.cooldown_sec
                 continue
 
-        # ── Signal detection (only when not in position) ─────────────────
-        if in_position:
+            continue  # still in position, no exit
+
+        # ── Signal detection ─────────────────────────────────────────
+        if ts < cooldown_end_ts:
             continue
 
-        # Cooldown check
-        if ts - last_exit_time_ms < cfg.cooldown_sec * 1000:
-            continue
+        # Compute rolling intensity using prefix sums
+        win_start = find_window_start(i)
+        buy_vol = buy_prefix[i + 1] - buy_prefix[win_start]
+        sell_vol = sell_prefix[i + 1] - sell_prefix[win_start]
+        total_vol = buy_vol + sell_vol
 
-        # Volume gate
         if total_vol < cfg.min_volume_usd:
+            signal_side = ""
             continue
 
-        # Detect persistent intensity
+        intensity = (buy_vol - sell_vol) / total_vol
+
         if abs(intensity) >= cfg.intensity_threshold:
             new_side = "LONG" if intensity > 0 else "SHORT"
 
-            if current_signal_side == new_side:
-                # Check if persistence requirement is met
-                elapsed_ms = ts - signal_start_ms
-                if elapsed_ms >= cfg.persistence_sec * 1000:
-                    # SIGNAL FIRED → ENTER
+            if signal_side == new_side and signal_start_idx >= 0:
+                elapsed = ts - buckets[signal_start_idx].timestamp_sec
+                if elapsed >= cfg.persistence_sec:
+                    # ENTER
                     in_position = True
                     position_side = new_side
-                    # Slippage on entry
-                    if new_side == "LONG":
-                        entry_price = price * (1 + SLIPPAGE_PCT)
-                    else:
-                        entry_price = price * (1 - SLIPPAGE_PCT)
-                    entry_time_ms = ts
+                    entry_price = price * (1 + SLIPPAGE_PCT) if new_side == "LONG" \
+                        else price * (1 - SLIPPAGE_PCT)
+                    entry_idx = i
                     entry_intensity = intensity
                     notional = balance * LEVERAGE * POSITION_PCT
                     qty = notional / entry_price
-
-                    # Reset signal tracking
-                    current_signal_side = ""
-                    signal_start_ms = 0
+                    signal_side = ""
+                    signal_start_idx = -1
             else:
-                # New signal direction — reset timer
-                current_signal_side = new_side
-                signal_start_ms = ts
+                signal_side = new_side
+                signal_start_idx = i
         else:
-            # Intensity dropped below threshold — reset
-            current_signal_side = ""
-            signal_start_ms = 0
-
-    # Close any open position at last price
-    if in_position and all_trades:
-        last_price = all_trades[-1].price
-        hold_sec = (all_trades[-1].timestamp_ms - entry_time_ms) / 1000
-        if position_side == "LONG":
-            pnl_gross = (last_price - entry_price) * qty
-        else:
-            pnl_gross = (entry_price - last_price) * qty
-        fee = FEE_PCT * notional + FEE_PCT * abs(last_price * qty)
-        slip = SLIPPAGE_PCT * notional
-        pnl_net = pnl_gross - fee - slip
-        balance += pnl_net
-        result.trades.append(Trade(
-            entry_time_ms=entry_time_ms,
-            exit_time_ms=all_trades[-1].timestamp_ms,
-            side=position_side,
-            entry_price=entry_price,
-            exit_price=last_price,
-            delta_intensity=entry_intensity,
-            pnl_usd=pnl_net,
-            pnl_pct=pnl_net / balance * 100,
-            result="EOF",
-            hold_seconds=hold_sec,
-        ))
+            signal_side = ""
+            signal_start_idx = -1
 
     result.final_balance = balance
     result.max_drawdown_pct = max_dd
@@ -457,232 +408,214 @@ def run_backtest(all_trades: list[AggTrade], cfg: BacktestConfig) -> BacktestRes
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
 
-def print_result(r: BacktestResult, verbose: bool = False) -> None:
+def print_result(r: BacktestResult) -> None:
     if r.total_trades == 0:
         return
-
     cfg = r.config
     ret = (r.final_balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100
-
     print(f"\n{'='*65}")
-    print(f"  Window {cfg.window_sec}s | Intensity {cfg.intensity_threshold:.2f} | "
-          f"Persist {cfg.persistence_sec}s | SL {cfg.sl_pct*100:.1f}% | TP {cfg.tp_pct*100:.1f}%")
+    print(f"  Win={cfg.window_sec}s Inten={cfg.intensity_threshold:.2f} "
+          f"Persist={cfg.persistence_sec}s SL={cfg.sl_pct*100:.1f}% TP={cfg.tp_pct*100:.1f}%")
     print(f"{'='*65}")
-    print(f"  Trades:       {r.total_trades}")
-    print(f"  Win / Loss:   {r.wins} / {r.total_trades - r.wins}")
-    print(f"  Win rate:     {r.win_rate:.1f}%")
-    print(f"  Avg win:      ${r.avg_win:.2f}")
-    print(f"  Avg loss:     ${r.avg_loss:.2f}")
-    print(f"  Profit factor:{r.profit_factor:.2f}")
-    print(f"  Total PnL:    ${r.total_pnl:.2f}")
-    print(f"  Return:       {ret:.2f}%")
-    print(f"  Max drawdown: {r.max_drawdown_pct:.2f}%")
-    print(f"  Avg hold:     {r.avg_hold_sec:.0f}s ({r.avg_hold_sec/60:.1f}min)")
+    print(f"  Trades:        {r.total_trades}")
+    print(f"  Win / Loss:    {r.wins} / {r.total_trades - r.wins}")
+    print(f"  Win rate:      {r.win_rate:.1f}%")
+    print(f"  Avg win:       ${r.avg_win:.2f}")
+    print(f"  Avg loss:      ${r.avg_loss:.2f}")
+    print(f"  Profit factor: {r.profit_factor:.2f}")
+    print(f"  Total PnL:     ${r.total_pnl:.2f}")
+    print(f"  Return:        {ret:+.2f}%")
+    print(f"  Max drawdown:  {r.max_drawdown_pct:.2f}%")
+    print(f"  Avg hold:      {r.avg_hold_sec:.0f}s")
 
-    # Exit type distribution
     exits = {}
     for t in r.trades:
         exits[t.result] = exits.get(t.result, 0) + 1
-    print(f"  Exit types:   {exits}")
+    print(f"  Exit types:    {exits}")
 
     # Daily breakdown
-    if verbose and r.trades:
-        days = {}
-        for t in r.trades:
-            day = datetime.fromtimestamp(t.entry_time_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-            if day not in days:
-                days[day] = {"trades": 0, "pnl": 0.0, "wins": 0}
-            days[day]["trades"] += 1
-            days[day]["pnl"] += t.pnl_usd
-            if t.pnl_usd > 0:
-                days[day]["wins"] += 1
-
-        print(f"\n  Daily breakdown:")
-        for day in sorted(days):
-            d = days[day]
-            wr = d["wins"] / d["trades"] * 100 if d["trades"] > 0 else 0
-            print(f"    {day}: {d['trades']:3d} trades, WR {wr:5.1f}%, PnL ${d['pnl']:+.2f}")
+    days: dict[str, dict] = {}
+    for t in r.trades:
+        day = datetime.fromtimestamp(t.entry_time_sec, tz=timezone.utc).strftime("%Y-%m-%d")
+        if day not in days:
+            days[day] = {"trades": 0, "pnl": 0.0, "wins": 0}
+        days[day]["trades"] += 1
+        days[day]["pnl"] += t.pnl_usd
+        if t.pnl_usd > 0:
+            days[day]["wins"] += 1
+    print(f"  Daily:")
+    for day in sorted(days):
+        d = days[day]
+        wr = d["wins"] / d["trades"] * 100 if d["trades"] > 0 else 0
+        print(f"    {day}: {d['trades']:3d} trades, WR {wr:5.1f}%, PnL ${d['pnl']:+.2f}")
 
 
-def print_summary(all_results: list[BacktestResult], days: int) -> None:
-    has_trades = [r for r in all_results if r.total_trades > 0]
+def print_summary(all_results: list[BacktestResult], span_days: float) -> None:
+    has_trades = [r for r in all_results if r.total_trades >= 3]
     if not has_trades:
-        print("\n  NO CONFIGURATIONS PRODUCED TRADES.")
+        print("\n  NO CONFIGURATIONS PRODUCED 3+ TRADES.")
         return
 
-    print(f"\n{'='*100}")
-    print(f"  SUMMARY — {days} days of data, ranked by PnL")
-    print(f"{'='*100}")
-    print(f"  {'Win':>4s} {'Pers':>5s} {'Inten':>6s} {'SL%':>5s} {'TP%':>5s} "
-          f"{'Trades':>7s} {'WR%':>6s} {'PnL$':>8s} {'Ret%':>7s} {'MaxDD%':>7s} "
-          f"{'PF':>5s} {'AvgW$':>7s} {'AvgL$':>7s} {'Hold':>6s}")
-    print(f"  {'-'*4} {'-'*5} {'-'*6} {'-'*5} {'-'*5} "
-          f"{'-'*7} {'-'*6} {'-'*8} {'-'*7} {'-'*7} "
-          f"{'-'*5} {'-'*7} {'-'*7} {'-'*6}")
+    print(f"\n{'='*105}")
+    print(f"  SUMMARY — {span_days:.1f} days, ranked by PnL (top 20)")
+    print(f"{'='*105}")
+    print(f"  {'Win':>4s} {'Int':>5s} {'Per':>4s} {'SL%':>5s} {'TP%':>5s} "
+          f"{'#Tr':>5s} {'WR%':>6s} {'PnL$':>9s} {'Ret%':>7s} {'MxDD%':>6s} "
+          f"{'PF':>5s} {'AvgW$':>7s} {'AvgL$':>7s} {'Hold':>5s} {'Tr/d':>5s}")
+    print(f"  {'-'*4} {'-'*5} {'-'*4} {'-'*5} {'-'*5} "
+          f"{'-'*5} {'-'*6} {'-'*9} {'-'*7} {'-'*6} "
+          f"{'-'*5} {'-'*7} {'-'*7} {'-'*5} {'-'*5}")
 
-    sorted_results = sorted(has_trades, key=lambda r: r.total_pnl, reverse=True)
-    for r in sorted_results[:20]:  # top 20
-        cfg = r.config
+    sorted_r = sorted(has_trades, key=lambda r: r.total_pnl, reverse=True)
+    for r in sorted_r[:20]:
+        c = r.config
         ret = (r.final_balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100
+        tpd = r.total_trades / span_days if span_days > 0 else 0
         print(
-            f"  {cfg.window_sec:4d} {cfg.persistence_sec:5.0f} {cfg.intensity_threshold:6.2f} "
-            f"{cfg.sl_pct*100:5.1f} {cfg.tp_pct*100:5.1f} "
-            f"{r.total_trades:7d} {r.win_rate:6.1f} {r.total_pnl:8.2f} {ret:7.2f} "
-            f"{r.max_drawdown_pct:7.2f} {r.profit_factor:5.2f} "
-            f"{r.avg_win:7.2f} {r.avg_loss:7.2f} {r.avg_hold_sec:5.0f}s"
+            f"  {c.window_sec:4d} {c.intensity_threshold:5.2f} {c.persistence_sec:4d} "
+            f"{c.sl_pct*100:5.1f} {c.tp_pct*100:5.1f} "
+            f"{r.total_trades:5d} {r.win_rate:6.1f} {r.total_pnl:9.2f} {ret:7.2f} "
+            f"{r.max_drawdown_pct:6.2f} {r.profit_factor:5.2f} "
+            f"{r.avg_win:7.2f} {r.avg_loss:7.2f} {r.avg_hold_sec:4.0f}s {tpd:5.1f}"
         )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Order Flow (aggTrades Delta) Backtest")
-    parser.add_argument("--symbol", default="BTCUSDT", help="Trading pair (default: BTCUSDT)")
-    parser.add_argument("--days", type=int, default=7, help="Days of data (default: 7)")
-    parser.add_argument("--download", action="store_true", help="Download data only (no backtest)")
-    parser.add_argument("--verbose", action="store_true", help="Show daily breakdown for each config")
+    parser = argparse.ArgumentParser(description="Order Flow Backtest (optimized)")
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--download", action="store_true", help="Download data only")
     args = parser.parse_args()
 
     symbol = args.symbol.upper()
-    days = args.days
 
     print("=" * 65)
     print(f"  ORDER FLOW BACKTEST — {symbol}")
     print("=" * 65)
-    print(f"  Balance: ${INITIAL_BALANCE}, Leverage: {LEVERAGE}x")
-    print(f"  Position: {POSITION_PCT*100:.0f}% of balance per trade")
+    print(f"  Balance: ${INITIAL_BALANCE}, Leverage: {LEVERAGE}x, "
+          f"Position: {POSITION_PCT*100:.0f}%")
     print(f"  Fees: {FEE_PCT*100:.2f}%/side, Slippage: {SLIPPAGE_PCT*100:.2f}%/side")
     print()
 
-    # 1. Download data
-    print(f"Step 1: Checking/downloading {days} days of {symbol} aggTrades...")
-    csv_paths = download_aggtrades(symbol, days=days)
+    # 1. Download
+    print(f"Step 1: Data ({args.days} days of {symbol} aggTrades)...")
+    csv_paths = download_aggtrades(symbol, days=args.days)
     if not csv_paths:
-        print("ERROR: No data files available!")
+        print("ERROR: No data!")
         return
-
     if args.download:
-        print(f"\nDownload complete. {len(csv_paths)} files ready.")
-        print(f"Run without --download to execute backtest.")
+        print(f"\nDownload complete. Run without --download to backtest.")
         return
 
-    # 2. Load all trades
-    print(f"\nStep 2: Loading trades from {len(csv_paths)} files...")
-    all_trades = []
-    for path in csv_paths:
-        day_trades = load_trades(path)
-        print(f"  {os.path.basename(path)}: {len(day_trades):,} trades")
-        all_trades.extend(day_trades)
+    # 2. Pre-aggregate into 1-second buckets
+    print(f"\nStep 2: Aggregating into 1-second buckets...")
+    t0 = time.time()
+    buckets = aggregate_to_buckets(csv_paths)
+    agg_time = time.time() - t0
+    print(f"  Aggregation took {agg_time:.1f}s")
 
-    # Sort by timestamp (should already be sorted, but make sure)
-    all_trades.sort(key=lambda t: t.timestamp_ms)
-    print(f"  Total: {len(all_trades):,} trades")
-
-    if not all_trades:
-        print("ERROR: No trades loaded!")
+    if not buckets:
+        print("ERROR: No data after aggregation!")
         return
 
-    # Time span
-    span_sec = (all_trades[-1].timestamp_ms - all_trades[0].timestamp_ms) / 1000
+    span_sec = buckets[-1].timestamp_sec - buckets[0].timestamp_sec
     span_days = span_sec / 86400
+
+    total_buy = sum(b.buy_volume_usd for b in buckets)
+    total_sell = sum(b.sell_volume_usd for b in buckets)
     print(f"  Span: {span_days:.1f} days")
+    print(f"  Buy volume:  ${total_buy/1e9:.2f}B")
+    print(f"  Sell volume: ${total_sell/1e9:.2f}B")
 
-    # Quick stats
-    total_buy_vol = sum(t.usd_volume for t in all_trades if t.is_buy)
-    total_sell_vol = sum(t.usd_volume for t in all_trades if not t.is_buy)
-    print(f"  Buy volume:  ${total_buy_vol/1e9:.2f}B")
-    print(f"  Sell volume: ${total_sell_vol/1e9:.2f}B")
-    print(f"  Net delta:   ${(total_buy_vol - total_sell_vol)/1e6:+.1f}M")
-
-    # 3. Run backtests with multiple configurations
-    print(f"\nStep 3: Running backtests...")
+    # 3. Run backtests — Phase 1: coarse grid (fast)
+    print(f"\nStep 3: Coarse grid search...")
 
     configs = []
-
-    # Vary: window size, intensity threshold, persistence, SL/TP
-    for window_sec in [15, 30, 60]:
-        for intensity in [0.30, 0.40, 0.50, 0.60, 0.70]:
+    for window in [10, 20, 30, 60]:
+        for intensity in [0.30, 0.45, 0.60]:
             for persist in [5, 10, 20]:
-                for sl, tp in [(0.003, 0.004), (0.004, 0.006), (0.005, 0.008),
-                               (0.003, 0.006), (0.005, 0.010)]:
+                for sl, tp in [(0.003, 0.005), (0.004, 0.007), (0.006, 0.010)]:
                     configs.append(BacktestConfig(
-                        window_sec=window_sec,
+                        window_sec=window,
                         intensity_threshold=intensity,
                         persistence_sec=persist,
                         sl_pct=sl,
                         tp_pct=tp,
                         cooldown_sec=30,
-                        max_hold_sec=300,   # 5 min max hold
-                        min_volume_usd=50_000,  # min $50K volume in window
+                        max_hold_sec=300,
+                        min_volume_usd=50_000,
                     ))
 
-    print(f"  Testing {len(configs)} configurations...")
-
+    print(f"  Testing {len(configs)} configs...", flush=True)
+    t0 = time.time()
     all_results = []
     for i, cfg in enumerate(configs):
-        if (i + 1) % 50 == 0:
-            print(f"    ... {i+1}/{len(configs)}")
-        result = run_backtest(all_trades, cfg)
-        all_results.append(result)
+        r = run_backtest(buckets, cfg)
+        all_results.append(r)
+        if (i + 1) % 20 == 0:
+            elapsed = time.time() - t0
+            eta = elapsed / (i + 1) * (len(configs) - i - 1)
+            print(f"    {i+1}/{len(configs)} done ({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
 
-    # 4. Print results
-    # Show top 5 detailed results
-    has_trades = sorted(
-        [r for r in all_results if r.total_trades >= 5],
-        key=lambda r: r.total_pnl, reverse=True,
-    )
+    total_time = time.time() - t0
+    print(f"  Completed in {total_time:.1f}s ({total_time/len(configs):.2f}s per config)")
 
+    # 4. Results
+    has_trades = [r for r in all_results if r.total_trades >= 3]
     if has_trades:
-        print(f"\n  Top 5 configurations (detailed):")
-        for r in has_trades[:5]:
-            print_result(r, verbose=args.verbose)
-    else:
-        print("\n  No configurations produced 5+ trades.")
+        top5 = sorted(has_trades, key=lambda r: r.total_pnl, reverse=True)[:5]
+        print(f"\n  Top 5 configs (detailed):")
+        for r in top5:
+            print_result(r)
 
-    print_summary(all_results, days)
+    print_summary(all_results, span_days)
 
     # 5. Recommendation
-    if has_trades:
-        best = has_trades[0]
-        cfg = best.config
+    viable = [r for r in all_results if r.total_trades >= 3]
+    if viable:
+        best = max(viable, key=lambda r: r.total_pnl)
+        c = best.config
         daily_pnl = best.total_pnl / span_days if span_days > 0 else 0
         daily_trades = best.total_trades / span_days if span_days > 0 else 0
 
-        print(f"\n  RECOMMENDED CONFIG:")
-        print(f"    Window:       {cfg.window_sec}s")
-        print(f"    Intensity:    {cfg.intensity_threshold:.2f}")
-        print(f"    Persistence:  {cfg.persistence_sec}s")
-        print(f"    SL/TP:        {cfg.sl_pct*100:.1f}% / {cfg.tp_pct*100:.1f}%")
-        print(f"    Cooldown:     {cfg.cooldown_sec}s")
+        print(f"\n  BEST CONFIG:")
+        print(f"    Window:       {c.window_sec}s")
+        print(f"    Intensity:    {c.intensity_threshold:.2f}")
+        print(f"    Persistence:  {c.persistence_sec}s")
+        print(f"    SL / TP:      {c.sl_pct*100:.1f}% / {c.tp_pct*100:.1f}%")
         print(f"    Trades/day:   {daily_trades:.1f}")
         print(f"    Daily PnL:    ${daily_pnl:.2f}")
-        print(f"    Monthly est:  ${daily_pnl * 30:.2f} ({daily_pnl * 30 / INITIAL_BALANCE * 100:.1f}%)")
+        print(f"    Monthly est:  ${daily_pnl*30:.2f} ({daily_pnl*30/INITIAL_BALANCE*100:.1f}%)")
         print(f"    Win rate:     {best.win_rate:.1f}%")
         print(f"    Max drawdown: {best.max_drawdown_pct:.2f}%")
         print(f"    Profit factor:{best.profit_factor:.2f}")
 
-        # Verdict
         if best.profit_factor >= 1.3 and best.win_rate >= 52:
-            print(f"\n  VERDICT: Strategy looks viable. Proceed with implementation.")
+            print(f"\n  VERDICT: Strategy looks VIABLE. Proceed with bot implementation.")
         elif best.profit_factor >= 1.1:
-            print(f"\n  VERDICT: Marginal edge. Needs tighter execution or better filters.")
+            print(f"\n  VERDICT: MARGINAL edge. Needs tighter execution or better filters.")
         else:
-            print(f"\n  VERDICT: No clear edge found. Consider different approach.")
+            print(f"\n  VERDICT: NO CLEAR EDGE. Consider different approach.")
 
-        # Save best trades
+        # Save trades
         if best.trades:
-            csv_out = f"data/orderflow_backtest_{symbol.lower()}.csv"
-            os.makedirs("data", exist_ok=True)
+            csv_out = os.path.join(os.path.dirname(__file__), "..", "data",
+                                   f"orderflow_backtest_{symbol.lower()}.csv")
+            os.makedirs(os.path.dirname(csv_out), exist_ok=True)
             with open(csv_out, "w") as f:
                 f.write("entry_time,exit_time,side,entry_price,exit_price,"
                         "intensity,pnl_usd,pnl_pct,result,hold_sec\n")
                 for t in best.trades:
-                    et = datetime.fromtimestamp(t.entry_time_ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                    xt = datetime.fromtimestamp(t.exit_time_ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    et = datetime.fromtimestamp(t.entry_time_sec, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    xt = datetime.fromtimestamp(t.exit_time_sec, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                     f.write(f"{et},{xt},{t.side},{t.entry_price:.2f},{t.exit_price:.2f},"
                             f"{t.delta_intensity:.4f},{t.pnl_usd:.2f},{t.pnl_pct:.4f},"
-                            f"{t.result},{t.hold_seconds:.0f}\n")
-            print(f"\n  Best config trades saved to {csv_out}")
+                            f"{t.result},{t.hold_seconds}\n")
+            print(f"\n  Trades saved to {csv_out}")
+    else:
+        print(f"\n  NO VIABLE CONFIGS found for {symbol}.")
 
 
 if __name__ == "__main__":
