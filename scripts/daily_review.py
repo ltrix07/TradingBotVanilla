@@ -47,7 +47,7 @@ import yaml
 
 # --- Paths --------------------------------------------------------------------
 ROOT        = Path(__file__).resolve().parent.parent
-CONFIGS_DIR = ROOT / "configs"
+CONFIG_FILE = ROOT / "config.yaml"
 DATA_DIR    = ROOT / "data"
 REVIEWS_DIR = DATA_DIR / "reviews"
 CHANGELOG   = REVIEWS_DIR / "history.jsonl"
@@ -63,7 +63,7 @@ logging.basicConfig(
 
 
 # --- Model / pricing ---------------------------------------------------------
-MODEL_ID         = "claude-opus-4-7"
+MODEL_ID         = "claude-sonnet-4-6"
 MAX_OUTPUT_TOKENS = 4096
 INPUT_PRICE_PER_MTOK  = 5.0   # USD per 1M input tokens
 OUTPUT_PRICE_PER_MTOK = 25.0  # USD per 1M output tokens
@@ -75,6 +75,7 @@ MIN_TRADES_FOR_REVIEW = 5
 # --- Sanity limits — hard bounds applied in apply_review.py ------------------
 # The same table is embedded into the prompt so Claude knows the envelope.
 SANITY_LIMITS: dict[str, tuple[float, float]] = {
+    # Risk management
     "risk_management.risk_per_trade_pct":          (0.003, 0.03),
     "risk_management.position_size_pct":           (0.01,  0.15),
     "risk_management.max_daily_loss_pct":          (0.02,  0.15),
@@ -82,22 +83,16 @@ SANITY_LIMITS: dict[str, tuple[float, float]] = {
     "risk_management.atr_tp_multiplier":           (1.0,   20.0),
     "risk_management.trailing_stop_atr_multiplier": (0.5,  5.0),
     "risk_management.breakeven_atr_multiplier":    (0.0,   5.0),
-    "risk_management.max_hold_time_minutes":       (15,    480),
+    "risk_management.max_hold_time_minutes":       (60,    6000),
     "risk_management.max_funding_rate_bps":        (10,    200),
     "risk_management.sl_confirm_seconds":          (0,     60),
     "risk_management.cooldown_after_sl_sec":       (0,     600),
-    "risk_management.time_stop_seconds":           (60,    3600),
+    "risk_management.time_stop_seconds":           (60,    14400),
     "risk_management.time_stop_max_loss_pct":      (0.0,   0.02),
     "exchange.leverage":                           (1,     10),
-    "strategy.parameters.fast_ema":                (3,     30),
-    "strategy.parameters.slow_ema":                (10,    100),
-    "strategy.parameters.signal_smoothing":        (2,     20),
-    "strategy.rsi.overbought":                     (60,    85),
-    "strategy.rsi.oversold":                       (15,    40),
-    "strategy.order_book.imbalance_threshold":     (0.50,  0.70),
-    "strategy.entry_filters.trend_ema_period":     (20,    300),
-    "strategy.entry_filters.volume_spike_multiplier": (1.0, 3.0),
-    "strategy.entry_filters.volume_spike_period":  (5,     30),
+    # VolBreakout strategy parameters
+    "strategy.vol_breakout.bb_period":             (10,    50),
+    "strategy.vol_breakout.squeeze_bw_pct":        (0.5,   5.0),
 }
 
 
@@ -112,35 +107,34 @@ FUNDING_SPIKE_BPS     = 75.0   # |funding| > 75 bps
 # =============================================================================
 
 def _load_trades(window_hours: float = 24.0) -> "pd.DataFrame":
-    """Load trades from the last `window_hours` across all trades_*.csv files.
+    """Load trades from the last `window_hours` from trades.csv (simulation log).
 
-    Prefers trades_hybrid.csv (what orchestrator actually produces) but also
-    picks up per-strategy CSVs so we can tell which configs were active.
+    The VolBreakout bot writes all trades to ROOT/trades.csv (configured in
+    config.yaml → simulation.log_file).
     """
     import pandas as pd
 
-    frames = []
-    for csv_path in sorted(DATA_DIR.glob("trades_*.csv")):
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception as exc:
-            log.warning("Skipping %s: %s", csv_path.name, exc)
-            continue
-        if df.empty:
-            continue
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        df = df.dropna(subset=["timestamp"])
-        # Tag with the strategy name from the filename: trades_hybrid.csv -> "hybrid"
-        strategy = csv_path.stem.replace("trades_", "")
-        df["strategy"] = strategy
-        frames.append(df)
-
-    if not frames:
+    # Primary: ROOT/trades.csv (from config simulation.log_file)
+    csv_path = ROOT / "trades.csv"
+    if not csv_path.exists():
+        log.info("trades.csv not found — no trades yet.")
         return pd.DataFrame()
 
-    all_trades = pd.concat(frames, ignore_index=True)
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:
+        log.warning("Failed to read trades.csv: %s", exc)
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df["strategy"] = "VolBreakout"
+
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
-    return all_trades[all_trades["timestamp"] >= cutoff].copy()
+    return df[df["timestamp"] >= cutoff].copy()
 
 
 def _load_regime() -> Optional["pd.DataFrame"]:
@@ -160,51 +154,32 @@ def _load_regime() -> Optional["pd.DataFrame"]:
         return None
 
 
-def _load_state(state_filename: str) -> Optional[dict]:
-    """Load a state_*.json file by bare name ('state_hybrid.json')."""
-    path = DATA_DIR / state_filename
+def _load_state() -> Optional[dict]:
+    """Load state.json from project root (VolBreakout single-strategy bot)."""
+    path = ROOT / "state.json"
     if not path.exists():
         return None
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception as exc:
-        log.warning("Failed to read %s: %s", state_filename, exc)
+        log.warning("Failed to read state.json: %s", exc)
         return None
 
 
-def _load_active_configs(trades: "pd.DataFrame") -> list[dict]:
-    """Return configs for strategies that actually traded in the window.
-
-    The 'hybrid' strategy in trades_hybrid.csv is produced by the orchestrator
-    which rotates among sniper/volume/trend. When we see trades_hybrid, we
-    load all three underlying configs so Claude can see the full picture.
-    """
-    strategies = set(trades["strategy"].unique())
-    target_files: set[str] = set()
-    for strat in strategies:
-        if strat == "hybrid":
-            target_files.update(
-                ["config_sniper.yaml", "config_volume.yaml", "config_trend.yaml"]
-            )
-        else:
-            target_files.add(f"config_{strat}.yaml")
-
-    configs = []
-    for fname in sorted(target_files):
-        path = CONFIGS_DIR / fname
-        if not path.exists():
-            log.info("Active-strategy config not found: %s", fname)
-            continue
-        try:
-            with open(path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
-            cfg["_filename"] = fname
-            configs.append(cfg)
-        except Exception as exc:
-            log.warning("Failed to parse %s: %s", fname, exc)
-
-    return configs
+def _load_active_configs() -> list[dict]:
+    """Return the single VolBreakout config from ROOT/config.yaml."""
+    if not CONFIG_FILE.exists():
+        log.warning("config.yaml not found at %s", CONFIG_FILE)
+        return []
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        cfg["_filename"] = "config.yaml"
+        return [cfg]
+    except Exception as exc:
+        log.warning("Failed to parse config.yaml: %s", exc)
+        return []
 
 
 def _load_changelog(days: int = 30) -> list[dict]:
@@ -410,6 +385,15 @@ def _detect_anomalies(state: Optional[dict], trades: "pd.DataFrame") -> list[dic
 
 _SYSTEM_PROMPT = """You are a quantitative trading analyst reviewing a crypto-futures paper-trading bot's last 24 hours.
 
+The bot runs a single strategy: **Volatility Breakout (Bollinger Squeeze)**.
+- It detects low-volatility compression (BB bandwidth < squeeze threshold).
+- When the squeeze ends and price breaks beyond the compressed range:
+  - Close above upper BB → LONG
+  - Close below lower BB → SHORT
+- SL/TP are ATR-based (dynamic). Trailing stop is enabled.
+- If price returns to BB mid while in a position, a "reverse close" triggers.
+- The strategy trades 1h candles on Binance Futures (perpetual).
+
 Your output MUST be a single valid JSON object with this exact schema:
 
 {
@@ -420,10 +404,10 @@ Your output MUST be a single valid JSON object with this exact schema:
   ],
   "proposed_diffs": [
     {
-      "file": "configs/config_trend.yaml",
+      "file": "config.yaml",
       "path": "risk_management.atr_sl_multiplier",
-      "current": 3.0,
-      "proposed": 2.5,
+      "current": 1.75,
+      "proposed": 2.0,
       "reason": "<one sentence citing the statistic that justifies the change>"
     },
     ...
@@ -437,6 +421,7 @@ Rules:
 - "path" uses dotted notation for nested YAML keys.
 - Every diff must cite the stat from the numbers block — vague reasoning is rejected.
 - If the day was statistically unremarkable (|total_pnl_usd| small, win-rate in [0.45, 0.55]), say so and propose no diffs.
+- The strategy was backtested and optimized: bb_period=22, squeeze_bw_pct=2.0, sl_atr=1.75, tp_atr=4.0. Only propose changes to these if there is strong statistical evidence.
 - Output JSON only. No markdown fences. No prose outside the JSON object."""
 
 
@@ -456,11 +441,10 @@ def _build_prompt(
                 "filename": c.get("_filename"),
                 "strategy_name": c.get("strategy", {}).get("name"),
                 "risk_management": c.get("risk_management", {}),
-                "strategy_parameters": c.get("strategy", {}).get("parameters", {}),
-                "rsi":          c.get("strategy", {}).get("rsi", {}),
-                "order_book":   c.get("strategy", {}).get("order_book", {}),
-                "entry_filters": c.get("strategy", {}).get("entry_filters", {}),
+                "vol_breakout": c.get("strategy", {}).get("vol_breakout", {}),
+                "timeframe": c.get("strategy", {}).get("timeframe"),
                 "exchange_leverage": c.get("exchange", {}).get("leverage"),
+                "exchange_symbol": c.get("exchange", {}).get("symbol"),
             }
             for c in configs
         ],
@@ -585,20 +569,18 @@ def _send_telegram(text: str, review_id: Optional[str] = None) -> None:
     """
     import requests
 
-    # Read creds from the first config that has them
+    # Read creds from config.yaml
     token = ""
     chat_id = ""
-    for cfg_path in CONFIGS_DIR.glob("*.yaml"):
+    if CONFIG_FILE.exists():
         try:
-            with open(cfg_path, encoding="utf-8") as f:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
             ep = cfg.get("endpoints", {})
-            if ep.get("telegram_bot_token") and ep.get("telegram_chat_id"):
-                token = ep["telegram_bot_token"]
-                chat_id = str(ep["telegram_chat_id"])
-                break
+            token = ep.get("telegram_bot_token", "")
+            chat_id = str(ep.get("telegram_chat_id", ""))
         except Exception:
-            continue
+            pass
 
     if not token or not chat_id:
         log.warning("Telegram creds not found in any config — skipping send.")
@@ -700,8 +682,8 @@ def main() -> None:
     trades = _load_trades(window_hours=args.window_hours)
     regime = _load_regime()
 
-    # Hybrid state for anomaly detection (stuck position, drawdown)
-    state = _load_state("state_hybrid.json")
+    # State for anomaly detection (stuck position, drawdown)
+    state = _load_state()
 
     stats     = _compute_stats(trades, regime)
     anomalies = _detect_anomalies(state, trades)
@@ -733,7 +715,7 @@ def main() -> None:
             "for statistical significance."
         )
     else:
-        configs   = _load_active_configs(trades)
+        configs   = _load_active_configs()
         changelog = _load_changelog(days=30)
 
         review["configs_analyzed"] = [c.get("_filename") for c in configs]

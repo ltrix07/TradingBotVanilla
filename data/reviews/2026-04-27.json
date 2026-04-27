@@ -1,0 +1,15 @@
+{
+  "date": "2026-04-27",
+  "generated": "2026-04-27T23:01:00.712031+00:00",
+  "window_hours": 24.0,
+  "stats": {
+    "total_trades": 0
+  },
+  "anomalies": [],
+  "configs_analyzed": [],
+  "llm_response": null,
+  "proposed_diffs": [],
+  "usage": {},
+  "status": "skipped_low_volume",
+  "skip_reason": "Only 0 trades in window — need >= 5 for statistical significance."
+}

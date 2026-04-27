@@ -43,10 +43,10 @@ from typing import Optional
 import requests
 import yaml
 
-ROOT        = Path(__file__).resolve().parent.parent
-CONFIGS_DIR = ROOT / "configs"
-REVIEWS_DIR = ROOT / "data" / "reviews"
-OFFSET_FILE = REVIEWS_DIR / ".telegram_offset"
+ROOT         = Path(__file__).resolve().parent.parent
+CONFIG_FILE  = ROOT / "config.yaml"
+REVIEWS_DIR  = ROOT / "data" / "reviews"
+OFFSET_FILE  = REVIEWS_DIR / ".telegram_offset"
 APPLY_SCRIPT = ROOT / "scripts" / "apply_review.py"
 
 REVIEWS_DIR.mkdir(parents=True, exist_ok=True)
@@ -68,20 +68,21 @@ LOOP_SLEEP   = 1     # fallback sleep on errors
 # --- Credentials & chat whitelist -------------------------------------------
 
 def _read_telegram_creds() -> tuple[str, str]:
-    """First (token, chat_id) pair found in configs/*.yaml."""
-    for cfg_path in sorted(CONFIGS_DIR.glob("*.yaml")):
-        try:
-            with open(cfg_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
-            ep = cfg.get("endpoints", {})
-            token = ep.get("telegram_bot_token", "")
-            chat  = str(ep.get("telegram_chat_id", ""))
-            if token and chat:
-                return token, chat
-        except Exception:
-            continue
+    """Read (token, chat_id) from config.yaml in project root."""
+    if not CONFIG_FILE.exists():
+        raise RuntimeError(f"config.yaml not found at {CONFIG_FILE}")
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        ep = cfg.get("endpoints", {})
+        token = ep.get("telegram_bot_token", "")
+        chat  = str(ep.get("telegram_chat_id", ""))
+        if token and chat:
+            return token, chat
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read config.yaml: {exc}") from exc
     raise RuntimeError(
-        "No telegram_bot_token / telegram_chat_id found in any configs/*.yaml"
+        "No telegram_bot_token / telegram_chat_id found in config.yaml"
     )
 
 

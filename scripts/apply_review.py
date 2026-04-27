@@ -33,8 +33,8 @@ from pathlib import Path
 import yaml
 
 ROOT        = Path(__file__).resolve().parent.parent
-CONFIGS_DIR = ROOT / "configs"
-BACKUPS_DIR = CONFIGS_DIR / "backups"
+CONFIG_FILE = ROOT / "config.yaml"
+BACKUPS_DIR = ROOT / "config_backups"
 REVIEWS_DIR = ROOT / "data" / "reviews"
 CHANGELOG   = REVIEWS_DIR / "history.jsonl"
 
@@ -52,6 +52,7 @@ logging.basicConfig(
 # Same sanity table as daily_review.py — import would create circular deps,
 # and duplicating here provides defence in depth.
 SANITY_LIMITS: dict[str, tuple[float, float]] = {
+    # Risk management
     "risk_management.risk_per_trade_pct":          (0.003, 0.03),
     "risk_management.position_size_pct":           (0.01,  0.15),
     "risk_management.max_daily_loss_pct":          (0.02,  0.15),
@@ -59,22 +60,16 @@ SANITY_LIMITS: dict[str, tuple[float, float]] = {
     "risk_management.atr_tp_multiplier":           (1.0,   20.0),
     "risk_management.trailing_stop_atr_multiplier": (0.5,  5.0),
     "risk_management.breakeven_atr_multiplier":    (0.0,   5.0),
-    "risk_management.max_hold_time_minutes":       (15,    480),
+    "risk_management.max_hold_time_minutes":       (60,    6000),
     "risk_management.max_funding_rate_bps":        (10,    200),
     "risk_management.sl_confirm_seconds":          (0,     60),
     "risk_management.cooldown_after_sl_sec":       (0,     600),
-    "risk_management.time_stop_seconds":           (60,    3600),
+    "risk_management.time_stop_seconds":           (60,    14400),
     "risk_management.time_stop_max_loss_pct":      (0.0,   0.02),
     "exchange.leverage":                           (1,     10),
-    "strategy.parameters.fast_ema":                (3,     30),
-    "strategy.parameters.slow_ema":                (10,    100),
-    "strategy.parameters.signal_smoothing":        (2,     20),
-    "strategy.rsi.overbought":                     (60,    85),
-    "strategy.rsi.oversold":                       (15,    40),
-    "strategy.order_book.imbalance_threshold":     (0.50,  0.70),
-    "strategy.entry_filters.trend_ema_period":     (20,    300),
-    "strategy.entry_filters.volume_spike_multiplier": (1.0, 3.0),
-    "strategy.entry_filters.volume_spike_period":  (5,     30),
+    # VolBreakout strategy parameters
+    "strategy.vol_breakout.bb_period":             (10,    50),
+    "strategy.vol_breakout.squeeze_bw_pct":        (0.5,   5.0),
 }
 
 INTEGER_PATHS = {
@@ -84,13 +79,7 @@ INTEGER_PATHS = {
     "risk_management.sl_confirm_seconds",
     "risk_management.cooldown_after_sl_sec",
     "risk_management.time_stop_seconds",
-    "strategy.parameters.fast_ema",
-    "strategy.parameters.slow_ema",
-    "strategy.parameters.signal_smoothing",
-    "strategy.rsi.overbought",
-    "strategy.rsi.oversold",
-    "strategy.entry_filters.trend_ema_period",
-    "strategy.entry_filters.volume_spike_period",
+    "strategy.vol_breakout.bb_period",
 }
 
 
@@ -181,12 +170,10 @@ def apply_review(review_id: str, confirm: bool) -> int:
     any_skipped = False
 
     for rel_file, file_diffs in by_file.items():
-        # Safety: only touch files under configs/
+        # Safety: only touch config.yaml in project root
         cfg_path = (ROOT / rel_file).resolve()
-        try:
-            cfg_path.relative_to(CONFIGS_DIR.resolve())
-        except ValueError:
-            log.error("Refusing to write outside configs/: %s", rel_file)
+        if cfg_path != CONFIG_FILE.resolve():
+            log.error("Refusing to write to non-config file: %s", rel_file)
             any_skipped = True
             continue
 
