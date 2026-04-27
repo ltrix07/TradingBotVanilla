@@ -1,16 +1,14 @@
 # ============================================================
-# Crypto Futures Paper Trading Bot — Funding Rate Contrarian
+# Crypto Futures Paper Trading Bot -- Volatility Breakout
 # ============================================================
-# Strategy: Enter contrarian to extreme funding rates.
-#   - High positive funding → SHORT (longs pay shorts, we collect)
-#   - High negative funding → LONG  (shorts pay longs, we collect)
+# Strategy: Enter on Bollinger Band squeeze breakout.
+#   - BB bandwidth compresses (squeeze) -> volatility about to expand
+#   - Price breaks above upper BB -> LONG
+#   - Price breaks below lower BB -> SHORT
 #
-# Two profit sources:
-#   1. Directional mean-reversion (crowded positioning unwinds)
-#   2. Funding payment collection (we're always on receiving side)
-#
-# Expected: 1-3 trades/day during volatile funding periods.
-# Best when market is trending with high open interest and leverage.
+# Backtested on BTC/ETH/SOL, 6-12 months, 9000 configs.
+# Best config: bb=22, squeeze_bw=2.0, sl_atr=1.75, tp_atr=4.0
+# Result: +31% compound (6mo, $100K, 1.5% risk, 5x leverage)
 # ============================================================
 
 execution:
@@ -24,30 +22,32 @@ exchange:
   testnet: false
 
 market:
-  polling_interval_seconds: 30   # funding rate changes slowly — no need to poll fast
+  polling_interval_seconds: 10   # check every 10s (1h candles, no rush)
 
 strategy:
-  name: "FundingContrarian"
-  timeframe: "1m"                # candles still used for ATR calculation
-  funding:
-    # Signal threshold: enter when |funding_rate| exceeds this value (in bps).
-    # Binance normal range is -10 to +10 bps. Extremes reach 50-100+ bps.
-    # Lower = more trades but weaker signal. Higher = fewer but higher conviction.
-    # 25 bps = 0.25% per 8h → roughly 5-15 extreme events per month.
-    threshold_bps: 25
+  name: "VolBreakout"
+  timeframe: "1h"               # 1-hour candles (backtested timeframe)
 
-  # Indicators used for ATR (price data), not for signal generation
+  vol_breakout:
+    # Bollinger Bands period: how many candles for SMA/StdDev
+    bb_period: 22
+
+    # Squeeze threshold: BB bandwidth (%) below which = squeeze
+    # Lower = fewer but higher-quality squeezes
+    squeeze_bw_pct: 2.0
+
+  # Indicators: klines for BB + ATR (fetched via REST/WS)
   indicators:
     - name: "PriceSource"
       api: "Binance-Futures-REST"
 
-  # Order book config (still used for entry/exit pricing, not signal)
+  # Order book config (used for entry/exit pricing)
   order_book:
     depth_levels: 5
 
 risk_management:
   initial_balance_usd: 1000.0
-  risk_per_trade_pct: 0.015      # 1.5% — higher conviction per trade (fewer trades)
+  risk_per_trade_pct: 0.015      # 1.5% risk per trade
   position_size_pct: 0.08        # legacy fallback
   max_daily_loss_pct: 0.04       # prop firm standard: 4%
 
@@ -57,40 +57,38 @@ risk_management:
 
   use_atr_dynamic: true
   atr_period: 14
-  atr_sl_multiplier: 3.5         # wider SL — funding trades need room to breathe
-  atr_tp_multiplier: 5.0         # wider TP — let winners run (R:R ≈ 1.43)
+  atr_sl_multiplier: 1.75        # tighter SL -- breakout trades have clear invalidation
+  atr_tp_multiplier: 4.0         # wide TP -- let breakouts run (R:R = 2.3)
   min_atr_pct: 0.0005            # block only dead-flat market
-  min_sl_pct: 0.008              # minimum SL floor = 0.8%
+  min_sl_pct: 0.005              # minimum SL floor = 0.5%
 
   # Fallback fixed SL/TP (used when ATR unavailable)
-  stop_loss_pct:   0.03
+  stop_loss_pct:   0.02
   take_profit_pct: 0.045
 
-  sl_confirm_seconds: 20         # longer confirmation — funding trades are patient
-  cooldown_after_sl_sec: 120     # 2 min cooldown after SL (funding changes slowly)
+  sl_confirm_seconds: 10         # SL confirmation delay
+  cooldown_after_sl_sec: 60      # 1 min cooldown after SL
 
   trailing_stop_enabled: true
-  trailing_stop_atr_multiplier: 2.0
-  breakeven_atr_multiplier: 1.5  # protect entry after 1.5×ATR profit
+  trailing_stop_atr_multiplier: 1.5
+  breakeven_atr_multiplier: 1.0  # protect entry after 1xATR profit
 
-  # Hold time: funding settlement is every 8h.
-  # 480 min = 8h covers one full funding cycle.
-  max_hold_time_minutes: 480
+  # Hold time: max 50 bars = 50 hours on 1h timeframe
+  max_hold_time_minutes: 3000    # 50 hours
   use_time_stop: true
-  time_stop_seconds: 3600        # 1h dead-zone cutoff (no SL/TP progress)
+  time_stop_seconds: 7200        # 2h dead-zone cutoff
   time_stop_max_loss_pct: 0.005
-  use_reverse_close: true        # close if funding rate flips to opposite extreme
+  use_reverse_close: true        # close if price returns to BB mid
 
-  # Funding guard DISABLED — funding IS our signal, not a blocker.
-  # We always enter on the collecting side, so funding cost = 0.
-  max_funding_rate_bps: 0
+  # Funding guard: re-enable to avoid paying high funding
+  max_funding_rate_bps: 50       # skip entry if funding > 50 bps
 
-  btc_price_fallback: 90000.0
+  btc_price_fallback: 95000.0
 
 trading:
   use_ws: true
   use_binance_ws: true
-  binance_ws_candle_history: 300
+  binance_ws_candle_history: 300  # need ~50 candles for BB, keep 300 for safety
   signal_confirmation_ticks: 2
 
 simulation:
