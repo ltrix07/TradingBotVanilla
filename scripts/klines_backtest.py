@@ -847,13 +847,13 @@ def print_summary(results: List[StrategyResult], symbol: str, timeframe: str):
     log.info(f"  Sharpe (approx): {best.sharpe_approx:.2f}")
 
     # Verdict
-    log.info(f"\n  VERDICT: ", end="")
     if best.total_pnl > 5 and best.profit_factor > 1.5 and best.win_rate > 40:
-        log.info("✅ PROMISING — worth implementing and forward-testing!")
+        verdict = "✅ PROMISING — worth implementing and forward-testing!"
     elif best.total_pnl > 0 and best.profit_factor > 1.1:
-        log.info("⚠️  MARGINAL — small edge, may not survive live conditions")
+        verdict = "⚠️  MARGINAL — small edge, may not survive live conditions"
     else:
-        log.info("❌ NO EDGE — none of the strategies are profitable")
+        verdict = "❌ NO EDGE — none of the strategies are profitable"
+    log.info(f"\n  VERDICT: {verdict}")
 
     # Per-strategy summary
     log.info(f"\n{'='*60}")
