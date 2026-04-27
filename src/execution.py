@@ -6,9 +6,9 @@ Simulates crypto futures (Long/Short) trading in paper mode:
   SHORT: profit when price falls → PnL = (entry_price - exit_price) * qty
   Fee:   charged on exit notional → fee_pct * exit_price * qty
 
-Balance accounting (paper mode):
-  open  — balance_usd -= filled_size_usd (margin deducted)
-  close — balance_usd += filled_size_usd + net_pnl (margin returned ± PnL)
+Balance accounting (paper mode, leveraged futures):
+  open  — balance_usd -= filled_size_usd / leverage  (margin deducted)
+  close — balance_usd += filled_size_usd / leverage + net_pnl (margin returned ± PnL)
 
 Prop Firm Daily Drawdown Guard:
   After each close, if daily_pnl <= -(initial_balance_usd * max_daily_loss_pct),
@@ -250,7 +250,9 @@ def open_position(
         sl_pct, tp_pct = compute_dynamic_sl_tp(None, cfg)
 
     portfolio = state["virtual_portfolio"]
-    portfolio["balance_usd"] -= filled_size_usd
+    leverage = max(1, int(cfg.get("exchange", {}).get("leverage", 1)))
+    margin_usd = filled_size_usd / leverage
+    portfolio["balance_usd"] -= margin_usd
     portfolio["active_position"] = {
         "id":                    str(uuid.uuid4()),
         "side":                  side,             # "LONG" or "SHORT"
@@ -258,6 +260,7 @@ def open_position(
         "entry_price":           fill_price,
         "qty":                   qty,
         "size_usd":              filled_size_usd,
+        "margin_usd":            round(margin_usd, 4),
         "requested_size_usd":    size_usd,
         "fill_pct":              round(fill_pct, 4),
         "sl_pct":                round(sl_pct, 4),
@@ -295,8 +298,8 @@ def close_position(
       Fee   = fee_pct * actual_exit_price * qty  (on exit notional)
       Net PnL = PnL_gross - Fee
 
-    Balance on close: balance += size_usd + net_pnl
-    (size_usd deducted on open is returned; net_pnl may be negative on loss)
+    Balance on close: balance += margin_usd + net_pnl
+    (margin deducted on open is returned; net_pnl may be negative on loss)
 
     Exit slippage direction:
       LONG  close → selling  → is_buy=False (price pushed DOWN)
@@ -345,7 +348,9 @@ def close_position(
     net_pnl = pnl_gross - fee
 
     # Return the deducted margin + net PnL (can be negative on a losing trade)
-    portfolio["balance_usd"] += size_usd + net_pnl
+    leverage = max(1, int(cfg.get("exchange", {}).get("leverage", 1)))
+    margin_usd = position.get("margin_usd", size_usd / leverage)
+    portfolio["balance_usd"] += margin_usd + net_pnl
     portfolio["daily_pnl"]   += net_pnl
 
     # ── Prop Firm Daily Drawdown Guard ───────────────────────────────────────
