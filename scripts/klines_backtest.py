@@ -54,6 +54,9 @@ class Trade:
     exit_reason: str  # TP / SL / TIMEOUT / SIGNAL
     pnl_pct: float
 
+INITIAL_BALANCE = 1000.0   # Default starting balance for $ calculations
+
+
 @dataclass
 class StrategyResult:
     name: str
@@ -73,7 +76,128 @@ class StrategyResult:
 
     @property
     def total_pnl(self) -> float:
+        """Simple sum of trade PnL percentages (no compounding)."""
         return sum(t.pnl_pct for t in self.trades)
+
+    # ── Mode 1: Monthly reset compound ──────────────────────────────
+    # Inside each month: compound (balance grows trade-by-trade).
+    # At month end: take profit, reset balance to initial.
+    # Total = sum of monthly % gains. Like a monthly "salary".
+
+    def monthly_compound(self, initial_balance: float = INITIAL_BALANCE) -> dict:
+        """Compound within each month, reset at month boundary.
+
+        Returns:
+            {
+                "months": [{"month": "2025-11", "pnl_pct": 3.5, "pnl_usd": 35.0, "trades": 8}, ...],
+                "total_pnl_pct": 19.2,
+                "total_pnl_usd": 192.0,
+                "avg_monthly_pct": 3.2,
+                "best_month_pct": 7.1,
+                "worst_month_pct": -2.3,
+                "profitable_months": 5,
+                "total_months": 6,
+            }
+        """
+        if not self.trades:
+            return {"months": [], "total_pnl_pct": 0, "total_pnl_usd": 0,
+                    "avg_monthly_pct": 0, "best_month_pct": 0, "worst_month_pct": 0,
+                    "profitable_months": 0, "total_months": 0}
+
+        # Group trades by month
+        from collections import OrderedDict
+        months: dict[str, list] = OrderedDict()
+        for t in self.trades:
+            dt = datetime.fromtimestamp(t.entry_time / 1000, tz=timezone.utc)
+            key = dt.strftime("%Y-%m")
+            months.setdefault(key, []).append(t)
+
+        month_results = []
+        total_pct = 0.0
+        total_usd = 0.0
+
+        for month_key, month_trades in months.items():
+            # Compound within the month
+            balance = 1.0
+            for t in month_trades:
+                balance *= (1 + t.pnl_pct / 100)
+            month_pct = (balance - 1) * 100
+            month_usd = initial_balance * month_pct / 100
+
+            month_results.append({
+                "month": month_key,
+                "pnl_pct": round(month_pct, 2),
+                "pnl_usd": round(month_usd, 2),
+                "trades": len(month_trades),
+            })
+            total_pct += month_pct
+            total_usd += month_usd
+
+        pcts = [m["pnl_pct"] for m in month_results]
+        return {
+            "months": month_results,
+            "total_pnl_pct": round(total_pct, 2),
+            "total_pnl_usd": round(total_usd, 2),
+            "avg_monthly_pct": round(total_pct / len(month_results), 2) if month_results else 0,
+            "best_month_pct": round(max(pcts), 2) if pcts else 0,
+            "worst_month_pct": round(min(pcts), 2) if pcts else 0,
+            "profitable_months": sum(1 for p in pcts if p > 0),
+            "total_months": len(month_results),
+        }
+
+    # ── Mode 2: Full compound (total reinvest) ─────────────────────
+    # Balance grows continuously, never reset.
+
+    def full_compound(self, initial_balance: float = INITIAL_BALANCE) -> dict:
+        """Full compound — total reinvestment, balance never resets.
+
+        Returns:
+            {
+                "final_balance": 1245.0,
+                "total_pnl_pct": 24.5,
+                "total_pnl_usd": 245.0,
+                "max_balance": 1300.0,
+                "min_balance": 920.0,
+                "max_drawdown_pct": 8.5,
+                "equity_curve": [(ts, balance), ...],  # for plotting
+            }
+        """
+        if not self.trades:
+            return {"final_balance": initial_balance, "total_pnl_pct": 0,
+                    "total_pnl_usd": 0, "max_balance": initial_balance,
+                    "min_balance": initial_balance, "max_drawdown_pct": 0,
+                    "equity_curve": []}
+
+        balance = initial_balance
+        peak = initial_balance
+        max_dd = 0.0
+        max_bal = initial_balance
+        min_bal = initial_balance
+        curve = [(self.trades[0].entry_time, initial_balance)]
+
+        for t in self.trades:
+            balance *= (1 + t.pnl_pct / 100)
+            peak = max(peak, balance)
+            dd = (peak - balance) / peak * 100
+            max_dd = max(max_dd, dd)
+            max_bal = max(max_bal, balance)
+            min_bal = min(min_bal, balance)
+            curve.append((t.exit_time, round(balance, 2)))
+
+        return {
+            "final_balance": round(balance, 2),
+            "total_pnl_pct": round((balance / initial_balance - 1) * 100, 2),
+            "total_pnl_usd": round(balance - initial_balance, 2),
+            "max_balance": round(max_bal, 2),
+            "min_balance": round(min_bal, 2),
+            "max_drawdown_pct": round(max_dd, 2),
+            "equity_curve": curve,
+        }
+
+    @property
+    def compound_pnl(self) -> float:
+        """Shortcut: full compound PnL %."""
+        return self.full_compound()["total_pnl_pct"]
 
     @property
     def avg_pnl(self) -> float:
@@ -91,17 +215,22 @@ class StrategyResult:
 
     @property
     def max_drawdown(self) -> float:
+        """Max drawdown based on compound equity curve."""
+        return self.full_compound()["max_drawdown_pct"]
+
+    @property
+    def max_consecutive_losses(self) -> int:
         if not self.trades:
-            return 0.0
-        equity = 0.0
-        peak = 0.0
-        max_dd = 0.0
+            return 0
+        max_streak = 0
+        current = 0
         for t in self.trades:
-            equity += t.pnl_pct
-            peak = max(peak, equity)
-            dd = peak - equity
-            max_dd = max(max_dd, dd)
-        return max_dd
+            if t.pnl_pct < 0:
+                current += 1
+                max_streak = max(max_streak, current)
+            else:
+                current = 0
+        return max_streak
 
     @property
     def sharpe_approx(self) -> float:
@@ -113,7 +242,7 @@ class StrategyResult:
         std = np.std(pnls, ddof=1)
         if std == 0:
             return 0.0
-        return mean / std * np.sqrt(len(pnls))  # annualized roughly
+        return mean / std * np.sqrt(len(pnls))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Data fetching
@@ -756,6 +885,36 @@ def get_config_grid():
     return configs
 
 
+def get_fine_grid_volbreakout():
+    """Fine-grained grid around winning VolBreakout parameters.
+
+    Winners from coarse grid:
+      BTC 6m:  bb=20, sq=2.0, sl=2.0, tp=3.0
+      BTC 12m: bb=20, sq=2.0, sl=2.0, tp=4.0
+      ETH 6m:  bb=30, sq=2.0, sl=2.0, tp=4.0
+      SOL 6m:  bb=15, sq=2.0, sl=2.0, tp=3.0
+
+    Fine grid explores around these with small steps.
+    """
+    configs = {"VolBreakout": []}
+
+    for bb_period in [12, 14, 16, 18, 20, 22, 25, 28, 30, 35]:
+        for squeeze_bw in [1.5, 1.75, 2.0, 2.25, 2.5, 3.0]:
+            for sl_atr in [1.5, 1.75, 2.0, 2.25, 2.5]:
+                for tp_atr in [2.5, 3.0, 3.5, 4.0, 4.5, 5.0]:
+                    for max_hold in [20, 25, 30, 40, 50]:
+                        configs["VolBreakout"].append({
+                            "bb_period": bb_period, "squeeze_bw_pct": squeeze_bw,
+                            "sl_atr_mult": sl_atr, "tp_atr_mult": tp_atr,
+                            "max_hold_bars": max_hold,
+                        })
+
+    total = len(configs["VolBreakout"])
+    log.info(f"  VolBreakout FINE grid: {total} configs")
+
+    return configs
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -774,25 +933,31 @@ def run_all(candles: List[Candle], configs: dict) -> List[StrategyResult]:
     for strat_name, cfgs in configs.items():
         func = STRATEGY_FUNCS[strat_name]
         log.info(f"\n{'='*60}")
-        log.info(f"Testing {strat_name} — {len(cfgs)} configs...")
-        log.info(f"{'='*60}")
+        log.info(f"Testing {strat_name} -- {len(cfgs)} configs...")
+        log.info(f"{'='*60}")fo(f"{'='*60}")
 
         best = None
+        log_step = max(1, len(cfgs) // 10)  # ~10 progress updates
         for idx, cfg in enumerate(cfgs):
             r = func(candles, cfg)
             results.append(r)
 
-            if r.n_trades >= 5 and (best is None or r.total_pnl > best.total_pnl):
+            fc = r.full_compound()
+            if r.n_trades >= 5 and (best is None or fc["total_pnl_pct"] > best.full_compound()["total_pnl_pct"]):
                 best = r
 
-            if (idx + 1) % 20 == 0:
+            if (idx + 1) % log_step == 0:
                 log.info(f"  ... {idx+1}/{len(cfgs)} done")
 
         if best:
+            fc = best.full_compound()
+            mc = best.monthly_compound()
             log.info(
                 f"\n  BEST {strat_name}: {best.n_trades} trades, "
-                f"WR={best.win_rate:.1f}%, PnL={best.total_pnl:.2f}%, "
-                f"PF={best.profit_factor:.2f}, MaxDD={best.max_drawdown:.2f}%"
+                f"WR={best.win_rate:.1f}%, "
+                f"Compound={fc['total_pnl_pct']:+.2f}% (${fc['total_pnl_usd']:+,.2f}), "
+                f"Mo.Reset={mc['total_pnl_pct']:+.2f}% (${mc['total_pnl_usd']:+,.2f}), "
+                f"PF={best.profit_factor:.2f}, MaxDD={fc['max_drawdown_pct']:.2f}%"
             )
             log.info(f"  Config: {best.config}")
         else:
@@ -801,8 +966,9 @@ def run_all(candles: List[Candle], configs: dict) -> List[StrategyResult]:
     return results
 
 
-def print_summary(results: List[StrategyResult], symbol: str, timeframe: str):
-    """Print final comparison table."""
+def print_summary(results: List[StrategyResult], symbol: str, timeframe: str,
+                   initial_balance: float = INITIAL_BALANCE):
+    """Print final comparison table with both PnL modes."""
 
     # Filter to results with at least 5 trades
     valid = [r for r in results if r.n_trades >= 5]
@@ -811,64 +977,95 @@ def print_summary(results: List[StrategyResult], symbol: str, timeframe: str):
         log.info("\n❌ No strategy produced ≥5 trades. Try longer history or different timeframe.\n")
         return
 
-    # Sort by total PnL
-    valid.sort(key=lambda r: r.total_pnl, reverse=True)
+    # Sort by compound PnL (full reinvest)
+    valid.sort(key=lambda r: r.full_compound(initial_balance)["total_pnl_pct"], reverse=True)
 
-    log.info(f"\n{'='*90}")
-    log.info(f"  FINAL RESULTS — {symbol} {timeframe} — Top 20 configs by total PnL")
-    log.info(f"{'='*90}")
-    log.info(f"{'Rank':<5} {'Strategy':<16} {'Trades':>7} {'WR%':>7} {'PnL%':>9} {'PF':>7} {'MaxDD%':>8} {'Sharpe':>7} {'Exits':>15}")
-    log.info("-" * 90)
+    log.info(f"\n{'='*120}")
+    log.info(f"  FINAL RESULTS — {symbol} {timeframe} — Top 20 by Compound PnL (balance=${initial_balance:,.0f})")
+    log.info(f"{'='*120}")
+    log.info(
+        f"{'#':<4} {'Strategy':<15} {'Trds':>5} {'WR%':>6} "
+        f"{'Mo.Reset%':>10} {'Mo.Reset$':>10} "
+        f"{'Compound%':>10} {'Compound$':>10} "
+        f"{'PF':>6} {'MaxDD%':>7} {'Sharpe':>7} {'ConsL':>6} {'Exits':>20}"
+    )
+    log.info("-" * 120)
 
     for rank, r in enumerate(valid[:20], 1):
-        # Count exit reasons
+        mc = r.monthly_compound(initial_balance)
+        fc = r.full_compound(initial_balance)
+
         exits = {}
         for t in r.trades:
             exits[t.exit_reason] = exits.get(t.exit_reason, 0) + 1
         exit_str = " ".join(f"{k}:{v}" for k, v in sorted(exits.items()))
 
         log.info(
-            f"{rank:<5} {r.name:<16} {r.n_trades:>7} {r.win_rate:>6.1f}% "
-            f"{r.total_pnl:>+8.2f}% {r.profit_factor:>6.2f} {r.max_drawdown:>7.2f}% "
-            f"{r.sharpe_approx:>6.2f} {exit_str:>15}"
+            f"{rank:<4} {r.name:<15} {r.n_trades:>5} {r.win_rate:>5.1f}% "
+            f"{mc['total_pnl_pct']:>+9.2f}% {mc['total_pnl_usd']:>+9.2f}$ "
+            f"{fc['total_pnl_pct']:>+9.2f}% {fc['total_pnl_usd']:>+9.2f}$ "
+            f"{r.profit_factor:>5.2f} {fc['max_drawdown_pct']:>6.2f}% "
+            f"{r.sharpe_approx:>6.2f} {r.max_consecutive_losses:>5} {exit_str:>20}"
         )
 
-    # Print best config details
+    # ── Detailed best config ──────────────────────────────────────────
     best = valid[0]
-    log.info(f"\n{'='*60}")
+    mc = best.monthly_compound(initial_balance)
+    fc = best.full_compound(initial_balance)
+
+    log.info(f"\n{'='*70}")
     log.info(f"  🏆 BEST OVERALL: {best.name}")
-    log.info(f"{'='*60}")
+    log.info(f"{'='*70}")
     log.info(f"  Config:  {best.config}")
-    log.info(f"  Trades:  {best.n_trades}")
-    log.info(f"  Win Rate: {best.win_rate:.1f}%")
-    log.info(f"  Total PnL: {best.total_pnl:+.2f}%")
-    log.info(f"  Profit Factor: {best.profit_factor:.2f}")
-    log.info(f"  Max Drawdown: {best.max_drawdown:.2f}%")
-    log.info(f"  Sharpe (approx): {best.sharpe_approx:.2f}")
+    log.info(f"  Trades:  {best.n_trades}  |  Win Rate: {best.win_rate:.1f}%")
+    log.info(f"  Profit Factor: {best.profit_factor:.2f}  |  Sharpe: {best.sharpe_approx:.2f}")
+    log.info(f"  Max Consecutive Losses: {best.max_consecutive_losses}")
+
+    log.info(f"\n  ── MODE 1: Monthly Reset (withdraw profit each month) ──")
+    log.info(f"  Total:  {mc['total_pnl_pct']:+.2f}%  =  ${mc['total_pnl_usd']:+,.2f}")
+    log.info(f"  Avg/month: {mc['avg_monthly_pct']:+.2f}%  =  ${initial_balance * mc['avg_monthly_pct'] / 100:+,.2f}")
+    log.info(f"  Best month:  {mc['best_month_pct']:+.2f}%  |  Worst month: {mc['worst_month_pct']:+.2f}%")
+    log.info(f"  Profitable months: {mc['profitable_months']}/{mc['total_months']}")
+
+    log.info(f"\n  ── MODE 2: Full Compound (total reinvestment) ──")
+    log.info(f"  ${initial_balance:,.0f} → ${fc['final_balance']:,.2f}  ({fc['total_pnl_pct']:+.2f}%)")
+    log.info(f"  Max balance: ${fc['max_balance']:,.2f}  |  Min balance: ${fc['min_balance']:,.2f}")
+    log.info(f"  Max Drawdown: {fc['max_drawdown_pct']:.2f}%")
+
+    # Monthly breakdown table
+    if mc["months"]:
+        log.info(f"\n  ── Monthly Breakdown ──")
+        log.info(f"  {'Month':<10} {'Trades':>7} {'PnL%':>9} {'PnL$':>10}")
+        log.info(f"  {'-'*40}")
+        for m in mc["months"]:
+            bar = "█" * max(0, int(m["pnl_pct"] / 0.5)) if m["pnl_pct"] > 0 else "▒" * max(0, int(-m["pnl_pct"] / 0.5))
+            log.info(f"  {m['month']:<10} {m['trades']:>7} {m['pnl_pct']:>+8.2f}% {m['pnl_usd']:>+9.2f}$ {bar}")
 
     # Verdict
-    if best.total_pnl > 5 and best.profit_factor > 1.5 and best.win_rate > 40:
+    cpnl = fc["total_pnl_pct"]
+    if cpnl > 5 and best.profit_factor > 1.3 and best.win_rate > 40:
         verdict = "✅ PROMISING — worth implementing and forward-testing!"
-    elif best.total_pnl > 0 and best.profit_factor > 1.1:
+    elif cpnl > 0 and best.profit_factor > 1.1:
         verdict = "⚠️  MARGINAL — small edge, may not survive live conditions"
     else:
         verdict = "❌ NO EDGE — none of the strategies are profitable"
     log.info(f"\n  VERDICT: {verdict}")
 
     # Per-strategy summary
-    log.info(f"\n{'='*60}")
+    log.info(f"\n{'='*70}")
     log.info(f"  Per-Strategy Summary")
-    log.info(f"{'='*60}")
+    log.info(f"{'='*70}")
 
     strat_names = set(r.name for r in valid)
     for name in sorted(strat_names):
         strat_results = [r for r in valid if r.name == name]
-        best_s = max(strat_results, key=lambda r: r.total_pnl)
-        profitable = sum(1 for r in strat_results if r.total_pnl > 0)
+        best_s = max(strat_results, key=lambda r: r.full_compound(initial_balance)["total_pnl_pct"])
+        fc_s = best_s.full_compound(initial_balance)
+        profitable = sum(1 for r in strat_results if r.full_compound(initial_balance)["total_pnl_pct"] > 0)
         log.info(
             f"  {name:<16}: {len(strat_results)} valid configs, "
             f"{profitable} profitable ({profitable/len(strat_results)*100:.0f}%), "
-            f"best PnL={best_s.total_pnl:+.2f}%"
+            f"best compound={fc_s['total_pnl_pct']:+.2f}% (${fc_s['total_pnl_usd']:+,.2f})"
         )
 
 
@@ -881,13 +1078,21 @@ def main():
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading pair (default: BTCUSDT)")
     parser.add_argument("--timeframe", default="1h", help="Candle interval: 1h, 4h (default: 1h)")
     parser.add_argument("--months", type=int, default=6, help="Months of history (default: 6)")
+    parser.add_argument("--balance", type=float, default=1000.0,
+                        help="Initial balance in USD (default: 1000)")
     parser.add_argument("--strategy", default="all",
                         help="Test specific strategy: MeanReversion, VolBreakout, TrendPullback, LiqSweep_SMC, or 'all'")
+    parser.add_argument("--fine", action="store_true",
+                        help="Use fine-grained grid for VolBreakout (9000 configs, ~5-10 min)")
     args = parser.parse_args()
 
+    global INITIAL_BALANCE
+    INITIAL_BALANCE = args.balance
+
+    mode_str = "FINE GRID" if args.fine else "COARSE GRID"
     log.info(f"\n{'='*60}")
-    log.info(f"  Multi-Strategy Backtest")
-    log.info(f"  {args.symbol} | {args.timeframe} | {args.months} months")
+    log.info(f"  Multi-Strategy Backtest [{mode_str}]")
+    log.info(f"  {args.symbol} | {args.timeframe} | {args.months} months | ${args.balance:,.0f}")
     log.info(f"{'='*60}\n")
 
     # Time range
@@ -910,20 +1115,23 @@ def main():
              f"{datetime.fromtimestamp(candles[-1].ts/1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}")
 
     # Get configs
-    configs = get_config_grid()
+    if args.fine:
+        configs = get_fine_grid_volbreakout()
+    else:
+        configs = get_config_grid()
 
-    # Filter if specific strategy requested
-    if args.strategy != "all":
-        if args.strategy not in configs:
-            log.error(f"Unknown strategy: {args.strategy}. Available: {list(configs.keys())}")
-            return
-        configs = {args.strategy: configs[args.strategy]}
+        # Filter if specific strategy requested
+        if args.strategy != "all":
+            if args.strategy not in configs:
+                log.error(f"Unknown strategy: {args.strategy}. Available: {list(configs.keys())}")
+                return
+            configs = {args.strategy: configs[args.strategy]}
 
     # Run
     results = run_all(candles, configs)
 
     # Summary
-    print_summary(results, args.symbol, args.timeframe)
+    print_summary(results, args.symbol, args.timeframe, args.balance)
 
 
 if __name__ == "__main__":
